@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+tools/uv/
+tools/python/
+tools/ffmpeg/
+tools/rcedit.exe
+.claude/
+*.tmp.mp4
