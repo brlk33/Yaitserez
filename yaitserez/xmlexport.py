@@ -68,8 +68,8 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
     clips = analysis["clips"]
     mics = analysis["mics"]
     phrases = analysis["phrases"]
-    first = clips[0]
-    tb, ntsc, fps = rate_of(first["fps_num"], first["fps_den"])
+    first = next((c for c in clips if not c.get("audio_only")), clips[0])
+    tb, ntsc, fps = rate_of(first.get("fps_num") or 25, first.get("fps_den") or 1)
     width, height = first["width"] or 1920, first["height"] or 1080
     files = _Files(tb, ntsc, fps)
     cam_audio = settings.get("camera_audio", "muted")  # "muted" | "on" | "off"
@@ -93,7 +93,7 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
         # таймлайн — в целых кадрах; позиция берётся из накопленных кадров, чтобы не было дыр
         if item["kind"] == "alt" and not alt_started:
             alt_started = True
-            pos += F(float(settings.get("alt_gap", 3.0))) if v_items else 0
+            pos += F(float(settings.get("alt_gap", 3.0))) if (v_items or a_mic) else 0
         start = pos
         end = start + (src_out - src_in)
         pos = end
@@ -101,7 +101,8 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
         vid, mid, cid = f"clipitem-v{n}", f"clipitem-m{n}", f"clipitem-c{n}"
         sync = clip["sync"]
         has_mic = sync["ok"] and sync["mic"] is not None
-        links = [(vid, "video", 1, len(v_items) + 1)]
+        audio_only = bool(clip.get("audio_only"))   # проект без видео: только дорожка звука
+        links = [] if audio_only else [(vid, "video", 1, len(v_items) + 1)]
         mic_xml = None
         if has_mic:
             mic = mics[sync["mic"]]
@@ -110,7 +111,7 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
             if m_in >= 0 and m_out <= F(mic["duration"]) + 1:
                 links.append((mid, "audio", 1, len(a_mic) + 1))
                 mic_xml = (mid, mic, m_in, m_out)
-        cam_on = clip["has_audio"] and (cam_audio != "off" or mic_xml is None)
+        cam_on = not audio_only and clip["has_audio"] and (cam_audio != "off" or mic_xml is None)
         if cam_on:
             links.append((cid, "audio", 2, len(a_cam) + 1))
 
@@ -120,13 +121,31 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
                 f"<clipindex>{ci}</clipindex>{'<groupindex>1</groupindex>' if mt == 'audio' else ''}</link>"
                 for ref, mt, ti, ci in links)
 
-        label = item["kind"] == "alt"
+        # метки цветом из Яйцереза → цвета меток Premiere; запасные дубли — Mango, как раньше
+        LABEL_NAMES = {1: "Rose", 2: "Mango", 3: "Yellow", 4: "Forest", 5: "Cerulean", 6: "Violet"}
+        lab = LABEL_NAMES.get(item.get("lab")) or ("Mango" if item["kind"] == "alt" else None)
+        label = lab is not None
+        # название клипа: как у исходника или по фразе, которая в нём звучит
         cname = escape(clip["name"])
-        v_items.append(
+        if settings.get("xml_names") == "phrase" and item.get("phrases"):
+            txt = " ".join(phrases[i]["text"] for i in item["phrases"] if 0 <= i < len(phrases)).strip()
+            if txt:
+                cname = escape(txt[:120])
+        z = item.get("z") or None
+        motion = ""
+        if z and not audio_only:
+            w_, h_ = clip.get("width") or width, clip.get("height") or height
+            motion = ("<filter><effect><name>Basic Motion</name><effectid>basic</effectid><effectcategory>motion</effectcategory>"
+                      "<effecttype>motion</effecttype><mediatype>video</mediatype>"
+                      f"<parameter><parameterid>scale</parameterid><name>Scale</name><valuemin>0</valuemin><valuemax>1000</valuemax><value>{float(z.get('s', 100)):.2f}</value></parameter>"
+                      f"<parameter><parameterid>center</parameterid><name>Center</name><value><horiz>{float(z.get('x', 0)) / w_:.5f}</horiz><vert>{float(z.get('y', 0)) / h_:.5f}</vert></value></parameter>"
+                      "</effect></filter>")
+        if not audio_only:
+          v_items.append(
             f'<clipitem id="{vid}"><name>{cname}</name><enabled>TRUE</enabled>'
             f"<duration>{F(clip['duration'])}</duration>{_rate(tb, ntsc)}<start>{start}</start><end>{end}</end>"
             f"<in>{src_in}</in><out>{src_out}</out>{files.ref(clip)}"
-            f"{'<labels><label2>Mango</label2></labels>' if label else ''}{link_xml()}</clipitem>")
+            f"{motion}{f'<labels><label2>{lab}</label2></labels>' if label else ''}{link_xml()}</clipitem>")
         for scr in item.get("scr") or []:
             if scr[0] >= len(screens):
                 continue
@@ -148,6 +167,7 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
                 f'<clipitem id="{mid}"><name>{escape(mic["name"])}</name><enabled>TRUE</enabled>'
                 f"<duration>{F(mic['duration'])}</duration>{_rate(tb, ntsc)}<start>{start}</start><end>{end}</end>"
                 f"<in>{m_in}</in><out>{m_out}</out>{files.ref(mic)}"
+                f"{f'<labels><label2>{lab}</label2></labels>' if label else ''}"
                 f"<sourcetrack><mediatype>audio</mediatype><trackindex>1</trackindex></sourcetrack>{link_xml()}</clipitem>")
         if cam_on:
             enabled = "TRUE" if (cam_audio == "on" or mic_xml is None) else "FALSE"

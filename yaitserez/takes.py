@@ -200,6 +200,7 @@ def _prefix_of(p: dict, q: dict) -> bool:
 
 
 def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, prefer: str = "last",
+             strictness: str = "medium",
              window: int = 12, max_distance: float = 150.0, llm: dict | None = None) -> None:
     """Проставляет каждой фразе auto-статус: main / alt / bad и причину.
 
@@ -209,7 +210,9 @@ def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, pr
     реплики не для зрителя; номер замены, который называет модель, не используется — его ищем сами.
     Оборванное в монтаж не попадает никогда.
     """
-    llm = llm or {}
+    llm = (llm or {}) if strictness != "soft" else {}
+    # порог «перефраз без подсказки модели»: мягко — почти дословно, строго — смелее
+    base_need = {"soft": 0.75, "medium": 0.62, "strict": 0.6}.get(strictness, 0.62)
     for p in phrases:
         p["group"] = p["id"]
         p["auto"] = "main"
@@ -253,7 +256,7 @@ def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, pr
         if p["id"] in bad and bad[p["id"]][0] in ("junk", "offscript"):
             continue
         hint = llm.get(p["id"])
-        need, need_n = (0.5, 2) if hint and hint["why"] == "repeat" else (0.62, 3)
+        need, need_n = (0.5, 2) if hint and hint["why"] == "repeat" else (base_need, 3)
         n_stems = len(_stems(p["tokens"]))
         best = None
         for j in range(i + 1, min(n, i + 1 + window)):
@@ -279,92 +282,96 @@ def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, pr
         if best is not None:
             replaced_by[p["id"]] = best
 
-    # 2а. цепочка переговорена ещё раз: если ЛЮБОЙ вариант из цепочки дублей повторяется позже её
-    #     последнего варианта, значит весь кусок сказан заново — последний вариант цепочки тоже не финальный.
     idx = {p["id"]: k for k, p in enumerate(phrases)}
-    for _round in range(4):
-        members: dict[int, list[int]] = {}
-        for a_id in replaced_by:
-            end = a_id
-            seen = set()
-            while end in replaced_by and end not in seen:
-                seen.add(end)
-                end = replaced_by[end]
-            members.setdefault(end, []).append(a_id)
-        moved = False
-        for last_id, earlier in members.items():
-            if last_id in replaced_by or last_id in bad:
-                continue
-            li = idx[last_id]
-            found = None
-            for k in range(li + 1, min(n, li + 1 + window)):
-                q = phrases[k]
-                if q["id"] in bad or q["start"] - phrases[li]["end"] > max_distance:
+    # средне и строго: цепочку, переговорённую ещё раз, видим всегда (это безопасно)
+    if strictness != "soft":
+        # 2а. цепочка переговорена ещё раз: если ЛЮБОЙ вариант из цепочки дублей повторяется позже её
+        #     последнего варианта, значит весь кусок сказан заново — последний вариант цепочки тоже не финальный.
+        for _round in range(4):
+            members: dict[int, list[int]] = {}
+            for a_id in replaced_by:
+                end = a_id
+                seen = set()
+                while end in replaced_by and end not in seen:
+                    seen.add(end)
+                    end = replaced_by[end]
+                members.setdefault(end, []).append(a_id)
+            moved = False
+            for last_id, earlier in members.items():
+                if last_id in replaced_by or last_id in bad:
                     continue
-                # позднее место должно повторять и сам последний вариант (а не только длинный ранний)
-                span = [x for x in phrases[k:k + 3] if x["id"] not in bad]
-                cl, shl = _coverage(phrases[li], span, weight)
-                if not (_similar(phrases[li]["tokens"], q["tokens"]) or (cl >= 0.4 and shl >= 2)):
-                    continue
-                for e_id in earlier + [last_id]:
-                    pe = phrases[idx[e_id]]
-                    cov, sh = _coverage(pe, [q], weight)
-                    if _similar(pe["tokens"], q["tokens"]) or (cov >= 0.62 and sh >= 2):
-                        found = q["id"]
+                li = idx[last_id]
+                found = None
+                for k in range(li + 1, min(n, li + 1 + window)):
+                    q = phrases[k]
+                    if q["id"] in bad or q["start"] - phrases[li]["end"] > max_distance:
+                        continue
+                    # позднее место должно повторять и сам последний вариант (а не только длинный ранний)
+                    span = [x for x in phrases[k:k + 3] if x["id"] not in bad]
+                    cl, shl = _coverage(phrases[li], span, weight)
+                    if not (_similar(phrases[li]["tokens"], q["tokens"]) or (cl >= 0.4 and shl >= 2)):
+                        continue
+                    for e_id in earlier + [last_id]:
+                        pe = phrases[idx[e_id]]
+                        cov, sh = _coverage(pe, [q], weight)
+                        if _similar(pe["tokens"], q["tokens"]) or (cov >= 0.62 and sh >= 2):
+                            found = q["id"]
+                            break
+                    if found is not None:
                         break
                 if found is not None:
-                    break
-            if found is not None:
-                replaced_by[last_id] = found
-                moved = True
-        if not moved:
-            break
+                    replaced_by[last_id] = found
+                    moved = True
+            if not moved:
+                break
 
-    # 2б. брошенная попытка абзаца: если фраза i перезаписана фразой j через несколько фраз,
-    #     всё между ними — неудачный дубль целого куска. Для этих фраз ищем повтор смысла дальше,
-    #     на длину всей новой попытки, с более мягким порогом.
-    idx = {p["id"]: k for k, p in enumerate(phrases)}
-    for a_id, b_id in sorted(replaced_by.items()):
-        i, j = idx[a_id], idx[b_id]
-        if j - i < 2:
-            continue
-        horizon = min(n, j + 3 * (j - i) + 8)
-        for m in range(i + 1, j):
-            pm = phrases[m]
-            if pm["id"] in bad or pm["id"] in replaced_by or len(_stems(pm["tokens"])) < 2:
+    # только «строго»: смелые правила по смыслу для целых абзацев
+    if strictness == "strict":
+        # 2б. брошенная попытка абзаца: если фраза i перезаписана фразой j через несколько фраз,
+        #     всё между ними — неудачный дубль целого куска. Для этих фраз ищем повтор смысла дальше,
+        #     на длину всей новой попытки, с более мягким порогом.
+        idx = {p["id"]: k for k, p in enumerate(phrases)}
+        for a_id, b_id in sorted(replaced_by.items()):
+            i, j = idx[a_id], idx[b_id]
+            if j - i < 2:
                 continue
-            for k in range(j, horizon):
-                q = phrases[k]
-                if q["id"] in bad or q["start"] - pm["end"] > max_distance * 2:
+            horizon = min(n, j + 3 * (j - i) + 8)
+            for m in range(i + 1, j):
+                pm = phrases[m]
+                if pm["id"] in bad or pm["id"] in replaced_by or len(_stems(pm["tokens"])) < 2:
                     continue
-                span = [x for x in phrases[k:k + 3] if x["id"] not in bad]
-                cov1, sh1 = _coverage(pm, [q], weight)
-                cov, sh = _coverage(pm, span, weight)
-                if (cov1 >= 0.4 and sh1 >= 2) or (cov1 >= 0.2 and cov >= 0.5 and sh >= 2):
-                    replaced_by[pm["id"]] = q["id"]
-                    break
+                for k in range(j, horizon):
+                    q = phrases[k]
+                    if q["id"] in bad or q["start"] - pm["end"] > max_distance * 2:
+                        continue
+                    span = [x for x in phrases[k:k + 3] if x["id"] not in bad]
+                    cov1, sh1 = _coverage(pm, [q], weight)
+                    cov, sh = _coverage(pm, span, weight)
+                    if (cov1 >= 0.4 and sh1 >= 2) or (cov1 >= 0.2 and cov >= 0.5 and sh >= 2):
+                        replaced_by[pm["id"]] = q["id"]
+                        break
 
-    # 2в. соседи брошенной попытки: если фразу перед p заменила далёкая фраза q, то и p, скорее всего,
-    #     переговорена рядом с q — проверяем мягче в окрестности q.
-    changed = True
-    while changed:
-        changed = False
-        for m in range(1, n):
-            pm, prev = phrases[m], phrases[m - 1]
-            if pm["id"] in bad or pm["id"] in replaced_by or prev["id"] not in replaced_by:
-                continue
-            qk = idx[replaced_by[prev["id"]]]
-            if qk - m < 2 or len(_stems(pm["tokens"])) < 2:
-                continue
-            for k in range(max(m + 1, qk - 2), min(n, qk + 5)):
-                q = phrases[k]
-                if q["id"] in bad:
+        # 2в. соседи брошенной попытки: если фразу перед p заменила далёкая фраза q, то и p, скорее всего,
+        #     переговорена рядом с q — проверяем мягче в окрестности q.
+        changed = True
+        while changed:
+            changed = False
+            for m in range(1, n):
+                pm, prev = phrases[m], phrases[m - 1]
+                if pm["id"] in bad or pm["id"] in replaced_by or prev["id"] not in replaced_by:
                     continue
-                cov, sh = _coverage(pm, [q], weight)
-                if cov >= 0.45 and sh >= 2:
-                    replaced_by[pm["id"]] = q["id"]
-                    changed = True
-                    break
+                qk = idx[replaced_by[prev["id"]]]
+                if qk - m < 2 or len(_stems(pm["tokens"])) < 2:
+                    continue
+                for k in range(max(m + 1, qk - 2), min(n, qk + 5)):
+                    q = phrases[k]
+                    if q["id"] in bad:
+                        continue
+                    cov, sh = _coverage(pm, [q], weight)
+                    if cov >= 0.45 and sh >= 2:
+                        replaced_by[pm["id"]] = q["id"]
+                        changed = True
+                        break
 
     # 3. группы для подписи «дубль N из M»
     parent = list(range(n))

@@ -9,7 +9,7 @@ RequestExecutionLevel user
 !define EXE ".venv\Scripts\Yaitserez.exe"
 !define REGKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Yaitserez"
 !ifndef VERSION
-  !define VERSION "1.1.0"
+  !define VERSION "1.2.0"
 !endif
 
 Name "${APPNAME}"
@@ -58,6 +58,7 @@ Section "Install"
   File "..\ui\app.js"
   File "..\ui\i18n.js"
   File "..\ui\timeline.js"
+  File "..\ui\editor.js"
   File "..\ui\logo.svg"
   File "..\ui\logo.png"
   File "..\ui\icon.ico"

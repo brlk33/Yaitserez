@@ -34,6 +34,64 @@ def envelope(audio16k: np.ndarray) -> np.ndarray:
     return (20 * np.log10(rms)).astype(np.float32)
 
 
+PEAK_FPS = 200
+
+
+def peaks(audio16k: np.ndarray) -> bytes:
+    """Пики волны для дорожки A1, как в Premiere: 200 значений в секунду, 0–255 (мягкая кривая,
+    чтобы тихая речь тоже была видна)."""
+    hop = 16000 // PEAK_FPS
+    n = len(audio16k) // hop
+    if n == 0:
+        return b"\0"
+    p = np.abs(audio16k[: n * hop].reshape(n, hop)).max(axis=1)
+    v = np.clip(p, 0.0, 1.0) ** 0.6 * 255.0
+    return v.astype(np.uint8).tobytes()
+
+
+_VAD = None
+
+
+def voice_prob(audio16k: np.ndarray) -> np.ndarray | None:
+    """Вероятность голоса от нейросети Silero VAD (она уже есть внутри faster-whisper), 0…255,
+    100 значений в секунду. Голос — 0,9…1, вдох и дыхание в микрофон — 0,2…0,6, тишина — около нуля.
+    Четыре часа записи — секунд двадцать на процессоре."""
+    global _VAD
+    try:
+        if _VAD is None:
+            from faster_whisper.vad import get_vad_model
+            _VAD = get_vad_model()
+        n = len(audio16k) // 512 * 512
+        if n == 0:
+            return None
+        p = _VAD(np.ascontiguousarray(audio16k[:n], dtype=np.float32)).reshape(-1)   # по 32 мс
+    except Exception:  # noqa: BLE001 — без нейросети работаем по громкости и спектру
+        return None
+    frames = int(len(audio16k) * ENV_FPS // 16000)
+    idx = np.minimum((np.arange(frames) * (16000 / ENV_FPS) / 512).astype(np.int64), len(p) - 1)
+    return np.clip(p[idx] * 255.0, 0, 255).astype(np.uint8)
+
+
+def periodicity(audio16k: np.ndarray) -> np.ndarray:
+    """Насколько звук периодичен (есть высота тона), 0…1, 100 значений в секунду.
+    У голоса 0,5–0,8; у вдоха, дыхания в микрофон, щелчков и мычания сквозь нос — ниже.
+    Считается автокорреляцией на 50 кадрах в секунду и растягивается вдвое — быстро и для часов записи."""
+    hop, win = 320, 512
+    n = max(0, (len(audio16k) - win) // hop + 1)
+    out = np.zeros(max(n, 1), dtype=np.float16)
+    if n == 0:
+        return np.repeat(out, 2)
+    d = np.diff(audio16k.astype(np.float32), prepend=np.float32(0.0))   # без гула и ветра в микрофоне
+    w = np.hanning(win).astype(np.float32)
+    for s in range(0, n, 20000):
+        m = min(20000, n - s)
+        idx = (np.arange(m)[:, None] + s) * hop + np.arange(win)[None, :]
+        f = np.fft.rfft(d[idx] * w, 1024, axis=1)
+        r = np.fft.irfft(np.abs(f) ** 2, axis=1)[:, :240]
+        out[s:s + m] = (r[:, 40:230].max(axis=1) / (r[:, 0] + 1e-9)).astype(np.float16)
+    return np.repeat(out, 2)
+
+
 def lowband(audio16k: np.ndarray) -> np.ndarray:
     """Доля энергии 80–900 Гц (основа голоса) в полосе 80–8000 Гц, 100 значений в секунду.
     У голоса она высокая, у вдоха (шум) — низкая."""
@@ -66,26 +124,129 @@ PLOSIVE = set("кптчцkptc")       # смычка + щелчок: до 0,12 �
 FRICATIVE = set("сшщфхsfh")      # шипящие: до 0,18 с
 
 
+VOWELS = set("аеёиоуыэюяaeiouy")
+VAD_VOICE = 190     # 0,75: нейросеть уверена — голос
+VAD_BREATH = 165    # меньше 0,65: звук не голос (вдох, дыхание, щелчок)
+VOICED_C = set("взжбдглмнрйvzbdglmnrwj")
+
+
 def consonant_room(letter: str) -> float:
     """Сколько звука до/после гласной может занимать глухая согласная на краю слова."""
-    return 0.12 if letter in PLOSIVE else 0.18 if letter in FRICATIVE else 0.0  # слово начинается/кончается глухим звуком — он тоже «шумный», оставляем запас
+    return 0.12 if letter in PLOSIVE else 0.18 if letter in FRICATIVE else 0.0
+
+
+def _cluster_room(cluster: str, tail: bool) -> float:
+    room = 0.0
+    for ch in cluster:
+        if ch in "чц":
+            room += 0.16   # «ч» в «что», «чтобы» звучит как «ш» — длинный шум
+        elif ch in PLOSIVE:
+            room += 0.10
+        elif ch in FRICATIVE:
+            room += 0.15
+        elif ch in VOICED_C:
+            room += 0.08   # «в» перед «т» звучит как «ф», «з» как «с» — тоже шум, тоже часть слова
+    if tail and cluster.endswith(("ь", "ъ")):
+        room += 0.05       # мягкий конец («ть», «сь») тянется дольше
+    return min(room, 0.32)
+
+
+def head_room(word: str) -> tuple[float, bool]:
+    """(запас на согласные перед первой гласной, есть ли среди них смычка)."""
+    w = "".join(ch for ch in word.lower() if ch.isalpha())
+    i = next((k for k, ch in enumerate(w) if ch in VOWELS), len(w))
+    cl = w[:i]
+    return _cluster_room(cl, False), any(ch in PLOSIVE for ch in cl)
+
+
+def tail_room(word: str) -> tuple[float, bool]:
+    w = "".join(ch for ch in word.lower() if ch.isalpha())
+    i = max((k for k, ch in enumerate(w) if ch in VOWELS), default=-1)
+    cl = w[i + 1:]
+    return _cluster_room(cl, True), any(ch in PLOSIVE for ch in cl)
+
+
+def strong_level(env: np.ndarray) -> float:
+    """Громкость, с которой начинается настоящий голос (выше вдохов, мычания и шума комнаты)."""
+    floor = float(np.percentile(env, 15))
+    peak = float(np.percentile(env, 95))
+    return floor + max(15.0, 0.42 * (peak - floor))
+
+
+def tighten_words(ws: list[dict], env: np.ndarray, low: np.ndarray, per: np.ndarray | None = None,
+                  vad: np.ndarray | None = None) -> list[dict]:
+    """Whisper иногда растягивает слово на секунды: прячет в него вдох и «ам» перед фразой или
+    долгую паузу после брошенного дубля. По звуку возвращаем слову настоящие границы."""
+    if not len(env):
+        return ws
+    lowf = low.astype(np.float32)
+    strong = strong_level(env)
+    n = min(len(env), len(lowf))
+    voiced = (env[:n] > strong) & (lowf[:n] >= 0.55)
+    if vad is not None:   # «ам» нейросеть считает голосом — это нам и нужно: ищем разрывы между звуками речи
+        n = min(n, len(vad))
+        voiced = voiced[:n] & (vad[:n] >= VAD_VOICE)
+    out = [dict(w) for w in ws]
+    for k, w in enumerate(out):
+        letters = sum(ch.isalpha() for ch in w["w"])
+        lim = min(0.3 + 0.1 * letters, 1.6)
+        if w["e"] - w["s"] <= lim + 0.25:
+            continue
+        a, b = max(0, int(w["s"] * ENV_FPS)), min(n, int(w["e"] * ENV_FPS) + 1)
+        segs, start = [], None
+        for i in range(a, b):
+            if voiced[i] and start is None:
+                start = i
+            elif not voiced[i] and start is not None:
+                segs.append([start, i]); start = None
+        if start is not None:
+            segs.append([start, b])
+        clusters = []
+        for s0, e0 in segs:
+            if clusters and s0 - clusters[-1][1] < 30:   # разрыв меньше 0,3 с — то же слово
+                clusters[-1][1] = e0
+            else:
+                clusters.append([s0, e0])
+        if not clusters:
+            continue
+        prev = out[k - 1] if k > 0 else None
+        glued_prev = prev is not None and w["s"] - prev["e"] < 0.06
+        if len(clusters) == 1:   # одно слово и долгая тишина вокруг: обрезаем растянутый край
+            if glued_prev:
+                w["e"] = round(min(w["e"], clusters[0][1] / ENV_FPS + 0.15), 3)
+            else:
+                w["s"] = round(max(w["s"], clusters[0][0] / ENV_FPS - 0.15), 3)
+            continue
+        if glued_prev:   # слово продолжает речь — оно в начале, дальше пауза (брошенный дубль)
+            w["e"] = round(min(w["e"], clusters[0][1] / ENV_FPS + 0.08), 3)
+        else:            # перед словом — вдох или «ам», само слово в конце
+            w["s"] = round(max(w["s"], clusters[-1][0] / ENV_FPS - 0.12), 3)
+    return out
 
 
 def breath_params(sens: float) -> tuple[float, float, int]:
     """Чувствительность 0…1 → (на сколько дБ громче тишины, макс. доля низких частот, мин. длина в кадрах по 10 мс)."""
     sens = min(max(sens, 0.0), 1.0)
-    return 8.0 - 6.0 * sens, 0.35 + 0.25 * sens, int(round(13 - 7 * sens))
+    return 8.0 - 6.0 * sens, 0.35 + 0.32 * sens, int(round(13 - 9 * sens))
 
 
 def detect_breaths(env: np.ndarray, low: np.ndarray, spans: list[tuple[float, float]],
-                   sens: float = 0.6) -> list[tuple[float, float]]:
-    """Участки-вдохи между словами: громче тишины, но без низких частот голоса."""
+                   sens: float = 0.6, per: np.ndarray | None = None, vad: np.ndarray | None = None) -> list[tuple[float, float]]:
+    """Участки-вдохи между словами: громче тишины, но без голоса (нет низких частот или нет высоты тона)."""
     n = min(len(env), len(low))
+    if per is not None:
+        n = min(n, len(per))
     if n == 0:
         return []
     db, low_max, min_len = breath_params(sens)
     floor = float(np.percentile(env[:n], 15))
     cand = (env[:n] > floor + db) & (low[:n].astype(np.float32) < low_max)
+    if vad is not None:
+        n = min(n, len(vad))
+        cand = (env[:n] > floor + db) & (vad[:n] < VAD_BREATH)
+    elif per is not None:
+        strong = strong_level(env[:n])
+        cand |= (env[:n] > floor + db + 2) & (per[:n].astype(np.float32) < 0.3) & (env[:n] < strong + 4)
     inside = np.zeros(n, dtype=bool)
     for s, e in spans:  # внутри слов — не вдох (это шипящие и т. п.)
         a, b = max(0, int((s - 0.03) * ENV_FPS)), min(n, int((e + 0.03) * ENV_FPS) + 1)
@@ -116,51 +277,107 @@ class Edges:
     Здесь начало ищется по самому звуку: первый кадр, где громко и много низких частот (голос).
     """
 
-    def __init__(self, env, low, thr, sens):
+    def __init__(self, env, low, thr, sens, per=None, vad=None):
         self.env = env
         self.low = low.astype(np.float32)
-        self.n = min(len(env), len(low))
+        self.per = per.astype(np.float32) if per is not None else None
+        self.vad = vad
+        self.n = min(len(env), len(low), len(per) if per is not None else 1 << 30, len(vad) if vad is not None else 1 << 30)
         self.thr = thr
         self.floor = float(np.percentile(env[:self.n], 15)) if self.n else -100.0
         self.db, self.low_max, self.min_len = breath_params(sens)
 
+        self.strong = strong_level(env[:self.n]) if self.n else 0.0
+
     def voiced(self, k):
-        return 0 <= k < self.n and self.low[k] >= 0.55 and self.env[k] > self.thr - 4
+        # голос — громко и с низкими частотами; тихое мычание, вдох и щелчок языком сюда не попадают
+        return 0 <= k < self.n and self.low[k] >= 0.55 and self.env[k] > self.strong
+
+    def tonal(self, k):
+        """Опорный кадр голоса: нейросеть уверена, что это голос (без неё — высота тона или громкость)."""
+        if self.vad is not None:
+            return 0 <= k < self.n and self.vad[k] >= VAD_VOICE and self.env[k] > self.floor + 6
+        if self.per is None:
+            return self.voiced(k)
+        return 0 <= k < self.n and self.per[k] >= 0.5 and self.env[k] > self.strong - 4
+
+    def anchor(self, k):
+        return sum(self.tonal(k + j) for j in range(4)) >= 3
+
+    def loud(self, k):
+        return 0 <= k < self.n and self.env[k] > self.strong
 
     def breathy(self, k):
-        return 0 <= k < self.n and self.env[k] > self.floor + self.db and self.low[k] < self.low_max
+        if not (0 <= k < self.n and self.env[k] > self.floor + self.db):
+            return False
+        if self.vad is not None:   # звучит, но не голос — вдох, дыхание, щелчок
+            return self.vad[k] < VAD_BREATH
+        if self.low[k] < self.low_max:
+            return True
+        # дыхание в микрофон низкочастотное, но без высоты тона и тише голоса
+        return self.per is not None and self.per[k] < 0.3 and self.env[k] < self.strong + 4 and self.env[k] > self.floor + self.db + 2
 
     def onset(self, t_from: float, t_word: float) -> float | None:
-        """Первое место с голосом (3 кадра подряд) от t_from до t_word + 0,8 с."""
-        a, b = int(t_from * ENV_FPS), min(self.n - 2, int((t_word + 0.8) * ENV_FPS))
+        """Начало голоса: первая опора с высотой тона от t_from до t_word + 0,8 с, и от неё назад —
+        пока звук громкий, как голос (так в начало попадают «е» и «щ» перед опорной «ё»,
+        а вдох, дыхание в микрофон и мычание — нет)."""
+        a, b = int(t_from * ENV_FPS), min(self.n - 4, int((t_word + 0.8) * ENV_FPS))
         for k in range(max(0, a), b):
-            if self.voiced(k) and self.voiced(k + 1) and self.voiced(k + 2):
-                return k / ENV_FPS
+            if self.anchor(k):
+                j, gap, start = k - 1, 0, k
+                while j >= max(a, 0):
+                    if self.loud(j):
+                        start, gap = j, 0
+                    else:
+                        gap += 1
+                        if gap > 2:
+                            break
+                    j -= 1
+                return start / ENV_FPS
         return None
 
     def offset(self, t_word_end: float, t_to: float) -> float | None:
-        """Последнее место с голосом перед t_to (ищем назад до t_word_end − 0,6 с)."""
+        """Конец голоса: последняя опора с высотой тона перед t_to (назад до t_word_end − 0,6 с),
+        и от неё вперёд, пока звук громкий, как голос."""
         a, b = int((t_word_end - 0.6) * ENV_FPS), int(t_to * ENV_FPS)
-        for k in range(min(b, self.n - 1), max(a, 2), -1):
-            if self.voiced(k) and self.voiced(k - 1) and self.voiced(k - 2):
-                return (k + 1) / ENV_FPS
+        for k in range(min(b, self.n - 4), max(a, 2), -1):
+            if self.anchor(k):
+                j, gap, end = k + 4, 0, k + 4
+                while j < min(b, self.n):
+                    if self.loud(j) or (self.vad is not None and self.vad[j] >= VAD_VOICE and self.env[j] > self.floor + 6):
+                        end, gap = j + 1, 0
+                    else:
+                        gap += 1
+                        if gap > 2:
+                            break
+                    j += 1
+                return end / ENV_FPS
         return None
 
     def sounding(self, k):
         return 0 <= k < self.n and self.env[k] > self.floor + self.db
 
-    def sound_before(self, t_on: float, max_back: float, t_limit: float) -> float:
+    def sound_before(self, t_on: float, max_back: float, t_limit: float, max_gap: int = 6) -> float:
         """Начало звучания слова: от начала голоса назад, пока есть звук (смычка до 60 мс не прерывает).
         Так в слово попадают глухие начала — «к», «т», «п», «с» — а не только гласная."""
         k = int(t_on * ENV_FPS) - 1
         lo = max(int((t_on - max_back) * ENV_FPS), int(t_limit * ENV_FPS), 0)
-        start, gap = int(t_on * ENV_FPS), 0
+        start, gap, breath_run = int(t_on * ENV_FPS), 0, 0
         while k >= lo:
+            # тихий звук «не голос» с низкими частотами — это вдох, а не согласная: дальше не идём
+            # (у «с», «ш», «ф», «т» шум громче и почти без низких частот)
+            if self.vad is not None and self.sounding(k) and self.vad[k] < VAD_BREATH                     and self.env[k] < self.floor + 10 and self.low[k] > 0.12:
+                breath_run += 1          # похоже на вдох; одиночные кадры — хвост согласной, 40 мс подряд — уже вдох
+                if breath_run >= 4:
+                    break
+                k -= 1
+                continue
+            breath_run = 0
             if self.sounding(k):
                 start, gap = k, 0
             else:
                 gap += 1
-                if gap > 6:
+                if gap > max_gap:
                     break
             k -= 1
         return start / ENV_FPS
@@ -258,7 +475,7 @@ def word_cut_reasons(analysis: dict, settings: dict, word_overrides: dict | None
             out[i] = "repeat"
         elif settings.get("cut_profanity", True) and is_profane(w["n"]):
             out[i] = "profanity"
-        elif settings.get("cut_fillers", True) and (w["n"] in FILLERS or re.fullmatch(r"(э+|м+|хм+)(-[эм]+)*", w["n"])):
+        elif settings.get("cut_fillers", True) and (w["n"] in FILLERS or re.fullmatch(r"(э+|м+|хм+|а+м+|э+м+|аа+|ы+м*)(-[аэм]+)*", w["n"])):
             out[i] = "filler"
     # свой список слов и фраз
     patterns = [[norm(x) for x in str(p).split() if norm(x)] for p in settings.get("cut_words", []) or []]
@@ -303,6 +520,7 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
     keep_alts = settings.get("keep_alternates", True)
     cut_breaths = settings.get("cut_breaths", True)
     sens = float(settings.get("breath_sens", 0.6))
+    breath_split = settings.get("breath_mode", "all") != "edges"   # «edges»: вдохи режем только между дублями
     pause = float(settings.get("pause", settings.get("keep_pause", 0.25)))
     place = settings.get("pause_place", "auto")
     equalize = settings.get("equalize", True)
@@ -321,12 +539,16 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
     cache = analysis.setdefault("_breaths", {})
     for ci in range(len(clips)):
         if ci < len(lows):
-            edges[ci] = Edges(analysis["env"][ci], lows[ci], analysis["thr"][ci], sens)
+            pers = analysis.get("per") or []
+            per = pers[ci] if ci < len(pers) else None
+            vads = analysis.get("vad") or []
+            vad = vads[ci] if ci < len(vads) else None
+            edges[ci] = Edges(analysis["env"][ci], lows[ci], analysis["thr"][ci], sens, per, vad)
             if cut_breaths:
                 key = (ci, round(sens, 2))
                 if key not in cache:
                     spans = [(w["s"], w["e"]) for w in words if w["clip"] == ci]
-                    cache[key] = detect_breaths(analysis["env"][ci], lows[ci], spans, sens)
+                    cache[key] = detect_breaths(analysis["env"][ci], lows[ci], spans, sens, per, vad)
                 breaths[ci] = cache[key]
     starts = {ci: [b[0] for b in v] for ci, v in breaths.items()}
 
@@ -357,14 +579,16 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
                 if not re.search(r"[аеёиоуыэюяaeiouy]", w["n"]):
                     on = max(w["s"], lim)  # слово без гласной («к», «с», «в») — берём как есть
                 else:
-                    on = ed.onset(max(w["s"] - 0.15, lim), w["s"])
+                    # окно до конца слова: Whisper бывает растягивает слово, и голос в нём ближе к концу
+                    on = ed.onset(max(w["s"] - 0.15, lim), max(w["s"], w["e"] - 0.7))
                     if on is None or on > w["e"]:
                         on = w["s"]
-                room = consonant_room(w["n"][:1])
-                # назад тянемся только на длину глухой согласной, с которой слово пишется; дальше — кандидат во вдох
-                snd = ed.sound_before(on, room, lim) if room else on - 0.02
+                room, plos = head_room(w["n"])
+                # назад тянемся только на длину согласных, с которых слово начинается («вт», «чт», «ш»…);
+                # дальше — кандидат во вдох. Без смычки разрыв больше 30 мс — это уже щелчок, не слово
+                snd = ed.sound_before(on, room, lim, 6 if plos else 3) if room else on - 0.02
                 snd = min(snd, on - 0.02)
-                br = ed.breath_before(snd - 0.01, max(lim, snd - 1.0)) if cut_breaths else None
+                br = ed.breath_before(snd - 0.01, max(lim, snd - 1.5)) if cut_breaths else None
                 onset_cache[key] = (snd, br)
         return onset_cache[key]
 
@@ -382,7 +606,7 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
                 off = ed.offset(w["e"], min(w["e"] + 0.25, hi))
                 if off is None or off < w["s"]:
                     off = w["e"]
-                room = consonant_room(w["n"][-1:])
+                room, _ = tail_room(w["n"])
                 snd = ed.sound_after(off, room + 0.03, hi) if room else off + 0.03
                 snd = max(snd, off + 0.03)
                 stop = None
@@ -404,7 +628,7 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
             prev = words[cur[-1]] if cur else None
             if prev is not None and i == cur[-1] + 1 and w["clip"] == prev["clip"] and (
                 not remove_silence or (w["s"] - prev["e"] <= max_pause and not (
-                    cut_breaths and w["s"] - prev["e"] > 0.12
+                    cut_breaths and breath_split and w["s"] - prev["e"] > 0.12
                     and (breath_in(w["clip"], prev["e"], w["s"]) or word_onset(i)[1])))
             ):
                 cur.append(i)
@@ -427,10 +651,10 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
         hi = next_w["s"] - 0.03 if next_w is not None else dur
         snd_on, br = word_onset(run[0])
         s0 = max(snd_on - 0.01, lo, 0.0)
-        head_lim = max(lo, br[1] + 0.01) if br is not None else lo
+        head_lim = max(lo, br[1] + 0.03) if br is not None else lo
         snd_off, stop = word_offset(run[-1], hi)
         e0 = min(snd_off + 0.01, max(hi, snd_off), dur)
-        tail_lim = min(hi, stop - 0.01) if stop is not None else hi
+        tail_lim = min(hi, stop - 0.04) if stop is not None else hi
         if not remove_silence:
             # без удаления тишины: начало и конец клипа сохраняем, паузы внутри не трогаем
             if prev_w is None:
@@ -489,7 +713,8 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
                     i in cut_words for i in range(a["hi"] + 1, b["lo"]))
                 if not remove_silence and contiguous:
                     a["out"] = b["in"] = b["s0"]  # без удаления тишины соседние куски склеиваются как были
-                elif contiguous and b["vs"] - a["ve"] <= pos_pause + 0.02 and pause >= 0                         and not breath_in(a["clip"], a["ve"], b["vs"]):
+                elif contiguous and b["vs"] - a["ve"] <= pos_pause + 0.02 and pause >= 0 \
+                        and not (breath_split and breath_in(a["clip"], a["ve"], b["vs"])):
                     a["out"] = b["in"] = b["vs"]  # пауза и так не длиннее заданной — не режем
                 else:
                     distribute(a, b)
@@ -525,6 +750,15 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
                 rr["phrase"] = p["id"]
                 alt_ranges.append(rr)
 
+    phrase_ranges = {}
+    if settings.get("_with_ranges", True):
+        for p in phrases:
+            rs = [core(r) for r in runs_for(p["words"])]
+            if not rs:
+                continue
+            place_ranges(rs, True)
+            phrase_ranges[str(p["id"])] = [[r["clip"], r["in"], r["out"]] for r in rs]
+
     t = 0.0
     timeline = []
     for r in main_ranges:
@@ -556,6 +790,7 @@ def build_plan(analysis: dict, settings: dict, overrides: dict, word_overrides: 
         "alt_start": alt_start,
         "statuses": {str(k): v for k, v in status.items()},
         "cut_words": {str(k): v for k, v in cut_words.items()},
+        "pr": phrase_ranges,
         "stats": {
             "original": round(orig, 1),
             "result": round(main_dur, 1),

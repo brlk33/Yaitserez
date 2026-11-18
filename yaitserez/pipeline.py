@@ -56,7 +56,7 @@ def _clip_dict(v: MediaInfo) -> dict:
 _GPU_DECODE_OK: bool | None = None
 
 
-def make_proxy(clip: dict, mic: dict | None, offset: float, out: str, cancelled=lambda: False) -> None:
+def make_proxy(clip: dict, mic: dict | None, offset: float, out: str, cancelled=lambda: False, height: int = 540) -> None:
     """Лёгкая копия 540p со звуком микрофона. Сначала полностью на видеокарте (декодирование + масштаб +
     кодирование), если не вышло — декодирование на процессоре, затем чистый libx264."""
     global _GPU_DECODE_OK
@@ -76,11 +76,11 @@ def make_proxy(clip: dict, mic: dict | None, offset: float, out: str, cancelled=
     variants = []
     if _GPU_DECODE_OK is not False:
         variants.append(("gpu", ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", clip["path"]],
-                         ["-vf", "scale_cuda=-2:540:format=nv12"] + nvenc))
+                         ["-vf", f"scale_cuda=-2:{height}:format=nv12"] + nvenc))
     variants.append(("cpu+nvenc", ["-threads", "0", "-i", clip["path"]],
-                     ["-vf", "scale=-2:540:flags=fast_bilinear,format=yuv420p"] + nvenc))
+                     ["-vf", f"scale=-2:{height}:flags=fast_bilinear,format=yuv420p"] + nvenc))
     variants.append(("cpu", ["-threads", "0", "-i", clip["path"]],
-                     ["-vf", "scale=-2:540:flags=fast_bilinear,format=yuv420p", "-c:v", "libx264", "-preset",
+                     ["-vf", f"scale=-2:{height}:flags=fast_bilinear,format=yuv420p", "-c:v", "libx264", "-preset",
                       "ultrafast", "-crf", "28", "-g", "12", "-bf", "0"]))
     err = ""
     for name, vin, venc in variants:
@@ -142,6 +142,17 @@ class ProxyQueue:
             # лёгкая копия 540p со звуком микрофона внутри — для режима «Лёгкое качество»
             c["light"] = os.path.join(cache_dir(), "proxy_" + _key(*sig, 3) + ".mp4")
             c["light_ready"] = os.path.isfile(c["light"])
+            hgt = int(c.get("height") or 1080)
+            c["half_h"] = max(270, (hgt // 2) // 2 * 2)
+            c["half"] = os.path.join(cache_dir(), "proxy_" + _key(*sig, 3, c["half_h"]) + ".mp4")
+            c["half_ready"] = os.path.isfile(c["half"])
+            if c.get("audio_only"):
+                if c.get("direct"):
+                    c["video_src"], c["proxy_ready"] = c["path"], True
+                else:
+                    c["video_src"] = os.path.join(cache_dir(), "audio_" + _key(*sig, 1) + ".m4a")
+                    c["proxy_ready"] = os.path.isfile(c["video_src"])
+                continue
             if c.get("direct"):
                 c["video_src"] = c["path"]
                 if mic is not None and os.path.splitext(mic["path"])[1].lower() in BROWSER_AUDIO:
@@ -163,13 +174,39 @@ class ProxyQueue:
         if light:
             self.request_light()
 
+    def request_half(self):
+        """Копии в половину разрешения — по запросу (качество превью «1/2»)."""
+        if getattr(self, "half_requested", False):
+            return
+        self.half_requested = True
+        for k, c in enumerate(self.clips):
+            if not c.get("audio_only") and not c.get("half_ready"):
+                self.futures.append(self.pool.submit(self._half_job, k))
+
+    def _half_job(self, i):
+        c = self.clips[i]
+        err = None
+        try:
+            if not c["half_ready"] and not self.cancelled():
+                s = c["sync"]
+                mic = self.mics[s["mic"]] if s["ok"] else None
+                tmp = c["half"] + ".tmp.mp4"
+                make_proxy(c, mic, s["offset"], tmp, self.cancelled, height=c["half_h"])
+                if os.path.isfile(tmp):
+                    os.replace(tmp, c["half"])
+                    c["half_ready"] = True
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        done = sum(1 for x in self.clips if x.get("half_ready"))
+        self.on_ready(i, done, len(self.clips), err, light="half")
+
     def request_light(self):
         """Поставить в очередь лёгкие копии для клипов, которые сейчас играют из исходника."""
         if self.light_requested:
             return
         self.light_requested = True
         for k, c in enumerate(self.clips):
-            if c.get("direct") and not c["light_ready"]:
+            if c.get("direct") and not c["light_ready"] and not c.get("audio_only"):
                 self.futures.append(self.pool.submit(self._light_job, k))
 
     def _light_job(self, i):
@@ -198,14 +235,17 @@ class ProxyQueue:
                 mic = self.mics[s["mic"]] if s["ok"] else None
                 target = c["audio_src"] if c.get("direct") else c["video_src"]
                 tmp = target + (".tmp.m4a" if c.get("direct") else ".tmp.mp4")
-                if c.get("direct"):
+                if c.get("audio_only"):
+                    target, tmp = c["video_src"], c["video_src"] + ".tmp.m4a"
+                    make_audio_proxy(c, c, 0.0, tmp)
+                elif c.get("direct"):
                     make_audio_proxy(c, mic, s["offset"], tmp)
                 else:
                     make_proxy(c, mic, s["offset"], tmp, self.cancelled)
                 if os.path.isfile(tmp):
                     os.replace(tmp, target)
                     c["proxy_ready"] = True
-                    if not c.get("direct"):
+                    if not c.get("direct") and not c.get("audio_only"):
                         c["light_ready"] = True
         except Exception as e:  # noqa: BLE001
             err = str(e)
@@ -226,10 +266,18 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
             raise Cancelled()
 
     videos = order_videos([v for v in videos if v.has_video])
-    if not videos:
-        raise RuntimeError(L("Нет ни одного видеофайла.", "There are no video files."))
-    clips = [_clip_dict(v) for v in videos]
+    audio_only = not videos
+    if audio_only:
+        # только звук: каждая запись сама себе «клип» и сама себе микрофон
+        mics = order_videos([m for m in mics if m.has_audio])
+        if not mics:
+            raise RuntimeError(L("Нет ни одного видео- или аудиофайла.", "There are no video or audio files."))
+    clips = [_clip_dict(v) for v in (videos or mics)]
     mic_list = [_clip_dict(m) for m in mics]
+    if audio_only:
+        for i, c in enumerate(clips):
+            c["audio_only"] = True
+            c["direct"] = os.path.splitext(c["path"])[1].lower() in BROWSER_AUDIO
 
     # 1. синхронизация
     progress("sync", 0.0, L("Ищу совпадения звука", "Matching audio"))
@@ -239,7 +287,12 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
     to_sync = videos + screens
     sync_cache = os.path.join(cache_dir(), "sync_" + _key(2, *[_file_sig(v.path) for v in to_sync],
                                                            *[_file_sig(m.path) for m in mics]) + ".json")
-    if os.path.isfile(sync_cache):
+    if audio_only:
+        syncs = [{"mic": i, "offset": 0.0, "confidence": 1.0, "ok": True} for i in range(len(clips))]
+        if screens:
+            res = sync_videos(screens, mics, progress=lambda fr, msg: progress("sync", fr, msg))
+            syncs += [{"mic": r.mic_index, "offset": r.offset, "confidence": r.confidence, "ok": r.ok} for r in res]
+    elif os.path.isfile(sync_cache):
         with open(sync_cache, encoding="utf-8") as f:
             syncs = json.load(f)
     else:
@@ -254,7 +307,7 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
         c["kind"] = "screen"
     # мультикамера: видео, снятые одновременно с другими, — это не следующие дубли, а другие ракурсы.
     # Основная дорожка — непересекающиеся по времени клипы, остальные уезжают на дополнительные дорожки.
-    clips, extra = split_angles(clips)
+    clips, extra = (clips, []) if audio_only else split_angles(clips)
     for c in extra:
         c["kind"] = "camera"
     screen_list = extra + screen_list
@@ -286,7 +339,7 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
     done_dur = 0.0
     loader = ThreadPoolExecutor(max_workers=1)
     pending = loader.submit(source(clips[0])[0])
-    words_by_clip, envs, thrs, lows = [], [], [], []
+    words_by_clip, envs, thrs, lows, peaks, pers, vads = [], [], [], [], [], [], []
     try:
         for i, c in enumerate(clips):
             check()
@@ -296,6 +349,9 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
             src_sig = source(c)[1]
             envs.append(cutter.envelope(audio))
             lows.append(cutter.lowband(audio))
+            peaks.append(cutter.peaks(audio))
+            vads.append(cutter.voice_prob(audio))
+            pers.append(cutter.periodicity(audio) if vads[-1] is None else None)
             thrs.append(cutter.speech_threshold(envs[-1]))
             base, span = done_dur / total_dur, c["duration"] / total_dur
             done_dur += c["duration"]
@@ -326,6 +382,8 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
 
     # 4. фразы и дубли
     progress("takes", 0.0, L("Ищу дубли", "Looking for takes"))
+    words_by_clip = [cutter.tighten_words(ws, envs[i], lows[i], pers[i], vads[i]) if i < len(envs) else ws
+                     for i, ws in enumerate(words_by_clip)]
     words, phrases = takes.build_phrases(words_by_clip)
     hints = {}
     if settings.get("drop_bad_takes", True) and settings.get("smart_takes", True) and phrases:
@@ -347,7 +405,8 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
     progress("takes", 1.0, L(f"Найдено фраз: {len(phrases)}", f"Phrases found: {len(phrases)}"))
 
     return {"clips": clips, "mics": mic_list, "words": words, "phrases": phrases, "env": envs, "thr": thrs,
-            "proxies": proxies, "llm": hints, "low": lows, "screens": screen_list}
+            "proxies": proxies, "llm": hints, "low": lows, "screens": screen_list,
+            "peaks": peaks, "per": pers, "vad": vads}
 
 
 def mic_span(c: dict) -> tuple[int, float, float] | None:
@@ -425,7 +484,8 @@ def public_screens(analysis: dict) -> list[dict]:
 
 def classify(analysis: dict, settings: dict) -> None:
     takes.classify(analysis["words"], analysis["phrases"], enabled=settings.get("drop_bad_takes", True),
-                   prefer=settings.get("prefer_take", "last"), llm=analysis.get("llm"))
+                   prefer=settings.get("prefer_take", "last"), llm=analysis.get("llm"),
+                   strictness=settings.get("takes_strictness", "medium"))
 
 
 def public_analysis(analysis: dict) -> dict:
@@ -434,13 +494,15 @@ def public_analysis(analysis: dict) -> dict:
     return {
         "clips": [{"name": c["name"], "duration": c["duration"], "sync": c["sync"], "ready": c.get("proxy_ready", False),
                    "sepAudio": bool(c.get("audio_src")), "aOff": round(c.get("audio_offset", 0.0), 4),
-                   "direct": bool(c.get("direct")), "lightReady": bool(c.get("light_ready"))}
+                   "direct": bool(c.get("direct")), "lightReady": bool(c.get("light_ready")), "halfReady": bool(c.get("half_ready")),
+                   "fps": round(c["fps_num"] / c["fps_den"], 3) if c.get("fps_num") and c.get("fps_den") else 25,
+                   "w": c.get("width") or 0, "h": c.get("height") or 0, "audioOnly": bool(c.get("audio_only"))}
                   for c in analysis["clips"]],
         "mics": [m["name"] for m in analysis["mics"]],
         "screens": public_screens(analysis),
         "phrases": [
             {"id": p["id"], "clip": p["clip"], "start": round(p["start"], 3), "end": round(p["end"], 3),
-             "auto": p["auto"], "reason": p["reason"], "take": p["take"], "takes": p["takes"], "w0": p["words"][0],
+             "auto": p["auto"], "reason": p["reason"], "take": p["take"], "takes": p["takes"], "group": p.get("group", p["id"]), "w0": p["words"][0],
              "words": [[W[i]["w"], 1 if W[i]["cut"] else 0, round(W[i]["s"], 2)] for i in p["words"]]}
             for p in analysis["phrases"]
         ],

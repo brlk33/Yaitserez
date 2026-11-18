@@ -45,6 +45,13 @@ DEFAULTS = {
     "ui_zoom": 1.0,
     "drop_bad_takes": True,
     "smart_takes": True,
+    "takes_strictness": "medium",
+    "hotkey_preset": "premiere",
+    "snapping": True,
+    "xml_names": "source",
+    "zoom_a": 100, "zoom_b": 115, "zoom_bx": 0, "zoom_by": 0, "zoom_min": 1.0, "zoom_inside": True,
+    "breath_mode": "all",
+    "hotkeys": None,
     "keep_alternates": True,
     "prefer_take": "last",
     "alt_gap": 3.0,
@@ -68,7 +75,13 @@ def load_settings() -> dict:
             s["pause_place"] = "auto"
     except (OSError, ValueError):
         pass
+    s.update(FIXED)
     return s
+
+
+# Настройки, убранные из интерфейса: всегда лучшее значение (старые сохранённые не мешают)
+FIXED = {"equalize": True, "pause_place": "auto", "smart_takes": True, "prefer_take": "last",
+         "camera_audio": "muted", "keep_silent_clips": False, "screen_enabled": False}
 
 
 class State:
@@ -120,7 +133,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        m = re.match(r"^/(media|audio|light|screen)/(\d+)", self.path)
+        m = re.match(r"^/(media|audio|light|half|screen)/(\d+)", self.path)
         if not m:
             return super().do_GET()
         an = STATE.analysis
@@ -138,6 +151,8 @@ class Handler(SimpleHTTPRequestHandler):
             clip = an["clips"][idx]
         if kind == "light":
             path = clip.get("light") if clip.get("light_ready") else None
+        elif kind == "half":
+            path = clip.get("half") if clip.get("half_ready") else None
         elif not clip.get("proxy_ready"):
             return self.send_error(404)
         else:
@@ -196,6 +211,25 @@ def push(fn: str, payload) -> None:
             pass
 
 
+WAVE_FPS = 200
+
+
+def waveforms(an: dict) -> list[str]:
+    """Громкость звука микрофона для дорожки A1: 25 значений в секунду, 0–255, base64 по клипу."""
+    import base64
+
+    import numpy as np
+
+    if an.get("peaks"):
+        return [base64.b64encode(p).decode("ascii") for p in an["peaks"]]
+    out = []
+    for env in an.get("env") or []:
+        e = np.repeat(np.asarray(env, dtype=np.float32), 2)   # старый анализ без пиков: 100 → 200 в секунду
+        v = np.clip((e + 60.0) / 54.0, 0.0, 1.0) * 255.0
+        out.append(base64.b64encode(v.astype(np.uint8).tobytes()).decode("ascii"))
+    return out
+
+
 def fmt_info(info) -> str:
     if info.kind == "video":
         fps = info.fps
@@ -212,6 +246,30 @@ def file_public(fid: str, info) -> dict:
 
 
 # ---------- API для интерфейса ----------
+def plan_from_edl(an: dict, auto: dict, edl: list, settings: dict) -> dict:
+    """Ручной монтаж из интерфейса (куски по порядку) + запасные дубли из автоматики — в формат плана."""
+    timeline, t = [], 0.0
+    for it in edl:
+        c, a, b = int(it["clip"]), float(it["in"]), float(it["out"])
+        if b - a <= 0.02:
+            continue
+        timeline.append({"clip": c, "in": round(a, 3), "out": round(b, 3), "t": round(t, 3), "kind": "main",
+                         "phrases": list(it.get("phrases") or []), "lab": it.get("lab"), "z": it.get("z")})
+        t += b - a
+    main_dur = t
+    alts = [x for x in auto["timeline"] if x["kind"] == "alt"]
+    alt_start = None
+    if alts:
+        t += float(settings.get("alt_gap", 3.0))
+        alt_start = t
+        for x in alts:
+            timeline.append({**x, "t": round(t, 3)})
+            t += x["out"] - x["in"]
+    cutter._attach_screens(an, timeline)
+    return {**auto, "timeline": timeline, "duration": round(t, 3), "main_duration": round(main_dur, 3),
+            "alt_start": alt_start}
+
+
 class Api:
     def init(self):
         from yaitserez.transcribe import find_local_model, preload
@@ -326,7 +384,8 @@ class Api:
             STATE.analysis = an
             self._classify()
             plan = cutter.build_plan(an, STATE.settings, STATE.overrides, STATE.word_overrides, STATE.trims)
-            STATE.result_json = json.dumps({"analysis": pipeline.public_analysis(an), "plan": plan},
+            STATE.result_json = json.dumps({"analysis": pipeline.public_analysis(an), "plan": plan,
+                                            "wave": waveforms(an), "waveFps": WAVE_FPS},
                                            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             push("done", {})
         except pipeline.Cancelled:
@@ -390,24 +449,29 @@ class Api:
 
     def _classify(self):
         """Разбор дублей зависит только от двух настроек — пересчитываем лишь при их смене."""
-        key = (STATE.settings.get("drop_bad_takes"), STATE.settings.get("prefer_take"))
+        key = (STATE.settings.get("drop_bad_takes"), STATE.settings.get("prefer_take"),
+               STATE.settings.get("takes_strictness"))
         if key != STATE.class_key:
             pipeline.classify(STATE.analysis, STATE.settings)
             STATE.class_key = key
 
     def set_quality(self, q: str):
         """«original» — исходник + звук микрофона; «light» — лёгкие копии 540p со звуком внутри."""
-        self.save_settings({"preview_quality": "light" if q == "light" else "original"})
+        q = q if q in ("light", "half") else "original"
+        self.save_settings({"preview_quality": q})
         an = STATE.analysis
-        if q == "light" and an and an.get("proxies"):
-            an["proxies"].request_light()
+        if an and an.get("proxies"):
+            if q == "light":
+                an["proxies"].request_light()
+            elif q == "half":
+                an["proxies"].request_half()
         return True
 
     def set_lang(self, lang: str):
         self.save_settings({"ui_lang": lang})
         return True
 
-    def export(self):
+    def export(self, edl: list | None = None):
         an = STATE.analysis
         if not an:
             return None
@@ -422,6 +486,8 @@ class Api:
         if not path.lower().endswith(".xml"):
             path += ".xml"
         plan = cutter.build_plan(an, STATE.settings, STATE.overrides, STATE.word_overrides, STATE.trims)
+        if edl:
+            plan = plan_from_edl(an, plan, edl, STATE.settings)
         xmlexport.export(path, an, plan, STATE.settings, name=f"{name} — Yaitserez")
         return path
 
