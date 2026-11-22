@@ -11,10 +11,14 @@ set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 set "SILENT="
 set "NOSHORTCUT="
+set "LLM=9b"
 rem /silent: run from Yaitserez-Setup.exe - no pauses, the setup window shows the output
 for %%A in (%*) do (
   if /i "%%~A"=="/silent" set "SILENT=1"
   if /i "%%~A"=="/noshortcut" set "NOSHORTCUT=1"
+  if /i "%%~A"=="/llm=9b" set "LLM=9b"
+  if /i "%%~A"=="/llm=4b" set "LLM=4b"
+  if /i "%%~A"=="/llm=none" set "LLM=none"
 )
 if defined SILENT (
   set "PYTHONIOENCODING=mbcs:replace"
@@ -24,37 +28,41 @@ if defined SILENT (
 title Yaitserez install
 
 echo.
-echo === [1/6] uv (Python manager) ===
+echo === [1/7] uv (Python manager) ===
 if not exist "%UV%" (
   powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol='Tls12'; $z=Join-Path $env:TEMP 'yaitserez-uv.zip'; Invoke-WebRequest -UseBasicParsing 'https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip' -OutFile $z; Expand-Archive -Force $z 'tools\uv'"
 )
 if not exist "%UV%" goto :fail
 
 echo.
-echo === [2/6] Python 3.12 ===
+echo === [2/7] Python 3.12 ===
 if not exist "%PY%" (
   "%UV%" venv --python 3.12 --python-preference only-managed .venv || goto :fail
 )
 
 echo.
-echo === [3/6] Libraries: speech recognition, window, NVIDIA libraries - about 1.5 GB ===
+echo === [3/7] Libraries: speech recognition, window, NVIDIA libraries - about 1.5 GB ===
 "%UV%" pip install --python "%PY%" -r requirements.txt || goto :fail
 
 echo.
-echo === [4/6] ffmpeg ===
+echo === [4/7] ffmpeg ===
 if not exist "tools\ffmpeg\bin\ffmpeg.exe" (
   powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol='Tls12'; $z=Join-Path $env:TEMP 'yaitserez-ffmpeg.zip'; Invoke-WebRequest -UseBasicParsing 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $z; $t=Join-Path $env:TEMP 'yaitserez-ffmpeg'; if (Test-Path $t) { Remove-Item -Recurse -Force $t }; Expand-Archive -Force $z $t; $d=Get-ChildItem $t -Directory | Select-Object -First 1; New-Item -ItemType Directory -Force 'tools\ffmpeg\bin' | Out-Null; Copy-Item (Join-Path $d.FullName 'bin\ffmpeg.exe'),(Join-Path $d.FullName 'bin\ffprobe.exe') 'tools\ffmpeg\bin'; Remove-Item -Recurse -Force $t, $z"
 )
 if not exist "tools\ffmpeg\bin\ffmpeg.exe" goto :fail
 
 echo.
-echo === [5/6] Yaitserez.exe and icon ===
+echo === [5/7] Yaitserez.exe and icon ===
 "%PY%" tools\make_icon.py || goto :fail
 "%PY%" tools\make_exe.py || goto :fail
 
 echo.
-echo === [6/6] Shortcuts ===
+echo === [6/7] Shortcuts ===
 if not defined NOSHORTCUT "%PY%" tools\make_shortcut.py || goto :fail
+
+echo.
+echo === [7/7] AI model for takes (%LLM%) ===
+"%PY%" tools\get_llm.py %LLM%
 
 echo.
 echo === Done ===

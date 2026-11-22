@@ -1,4 +1,4 @@
-"""Смысловой разбор дублей локальной языковой моделью (Qwen3-4B из VoiceType через llama.cpp).
+"""Смысловой разбор дублей локальной языковой моделью (Qwen3.5 9B или 4B через llama.cpp).
 
 Правила по словам не видят перефразов («Для него это главный способ…» → «Для школы это один из
 главных способов…»). Модель читает расшифровку окнами и отмечает фразы, которые не должны попасть
@@ -18,14 +18,42 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from .i18n import L
-from .paths import cache_dir
+from .paths import app_dir, cache_dir
 
 PORT = 47661          # свой порт — не мешаем серверу самого VoiceType (47654)
 WINDOW = 40           # фраз в окне
 ZONE = 24             # по скольким из них модель принимает решение (остальное — контекст впереди)
 PARALLEL = 3
-PROMPT_VERSION = 3
+PROMPT_VERSION = 4
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+# Модели для разбора дублей: пользователь выбирает размер (точнее / меньше места)
+MODELS = {
+    "9b": {"file": "Qwen3.5-9B-Q4_K_M.gguf", "size": 5_680_000_000,
+           "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"},
+    "4b": {"file": "Qwen3.5-4B-Q4_K_M.gguf", "size": 2_740_000_000,
+           "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf"},
+}
+LLAMA_BUILD = "b12502"
+LLAMA_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_BUILD}/llama-{LLAMA_BUILD}-bin-win-cuda-12.4-x64.zip"
+CHOICE = {"model": "9b"}   # из настроек (llm_model)
+
+
+def models_dir() -> str:
+    return os.path.join(app_dir(), "models")
+
+
+def own_llama_dir() -> str:
+    return os.path.join(app_dir(), "llama")
+
+
+def model_path(choice: str) -> str:
+    return os.path.join(models_dir(), MODELS[choice]["file"])
+
+
+def has_model(choice: str) -> bool:
+    return os.path.isfile(model_path(choice))
 
 
 def _roots():
@@ -34,17 +62,91 @@ def _roots():
         yield os.path.join(base, "VoiceType")
 
 
-def find() -> tuple[str, str, list[str]] | None:
-    """(llama-server.exe, модель .gguf, папки с CUDA-библиотеками) или None."""
+def _server() -> tuple[str, list[str]] | None:
+    """llama-server.exe: свой (скачан установщиком) или из VoiceType."""
+    own = next(iter(glob.glob(os.path.join(own_llama_dir(), "**", "llama-server.exe"), recursive=True)), None)
+    venv_libs = glob.glob(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                                       ".venv", "Lib", "site-packages", "nvidia", "*", "bin"))
+    if own:
+        return own, [os.path.dirname(own)] + venv_libs
     for root in _roots():
         exe = next(iter(glob.glob(os.path.join(root, "tools", "llama", "**", "llama-server.exe"), recursive=True)), None)
-        models = sorted(glob.glob(os.path.join(root, "models", "editor", "*.gguf")))
-        if exe and models:
-            libs = [os.path.dirname(exe), os.path.join(root, ".venv", "Lib", "site-packages", "torch", "lib")]
-            libs += glob.glob(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                                           ".venv", "Lib", "site-packages", "nvidia", "*", "bin"))
-            return exe, models[0], [d for d in libs if os.path.isdir(d)]
+        if exe:
+            return exe, [os.path.dirname(exe), os.path.join(root, ".venv", "Lib", "site-packages", "torch", "lib")] + venv_libs
     return None
+
+
+def _model() -> str | None:
+    """Выбранная модель; если её нет — другая скачанная; в крайнем случае — Qwen из VoiceType."""
+    pick = CHOICE.get("model", "9b")
+    for c in [pick] + [k for k in MODELS if k != pick]:
+        if c in MODELS and has_model(c):
+            return model_path(c)
+    for root in _roots():
+        models = sorted(glob.glob(os.path.join(root, "models", "editor", "*.gguf")))
+        if models:
+            return models[0]
+    return None
+
+
+def find() -> tuple[str, str, list[str]] | None:
+    """(llama-server.exe, модель .gguf, папки с CUDA-библиотеками) или None."""
+    srv, m = _server(), _model()
+    if not srv or not m:
+        return None
+    exe, libs = srv
+    return exe, m, [d for d in libs if os.path.isdir(d)]
+
+
+def status() -> dict:
+    srv, m = _server(), _model()
+    return {"choice": CHOICE.get("model", "9b"), "server": bool(srv), "using": os.path.basename(m) if m else None,
+            **{f"has_{k}": has_model(k) for k in MODELS},
+            **{f"size_{k}": v["size"] for k, v in MODELS.items()}}
+
+
+def _fetch(url: str, dst: str, progress=None, cancelled=lambda: False, total_hint: int = 0) -> None:
+    """Скачать с докачкой (.part), прогресс 0…1."""
+    part = dst + ".part"
+    have = os.path.getsize(part) if os.path.isfile(part) else 0
+    req = urllib.request.Request(url, headers={"User-Agent": "Yaitserez", **({"Range": f"bytes={have}-"} if have else {})})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        if have and r.status != 206:
+            have = 0
+        total = have + int(r.headers.get("Content-Length") or 0) or total_hint
+        with open(part, "ab" if have else "wb") as f:
+            got, last = have, 0.0
+            while True:
+                if cancelled():
+                    raise RuntimeError(L("Скачивание остановлено", "Download stopped"))
+                buf = r.read(1 << 20)
+                if not buf:
+                    break
+                f.write(buf)
+                got += len(buf)
+                now = time.time()
+                if progress and now - last > 0.3:
+                    last = now
+                    progress(got / total if total else 0.0, got, total)
+    os.replace(part, dst)
+
+
+def download(choice: str, progress=None, cancelled=lambda: False) -> str:
+    """Скачать выбранную модель (и llama-server, если его нет ни у нас, ни в VoiceType)."""
+    os.makedirs(models_dir(), exist_ok=True)
+    if _server() is None:
+        import zipfile
+        z = os.path.join(models_dir(), f"llama-{LLAMA_BUILD}.zip")
+        _fetch(LLAMA_URL, z, (lambda fr, g, t: progress(fr * 0.06, g, t)) if progress else None, cancelled)
+        os.makedirs(own_llama_dir(), exist_ok=True)
+        with zipfile.ZipFile(z) as zf:
+            zf.extractall(own_llama_dir())
+        os.remove(z)
+    m = MODELS[choice]
+    if not has_model(choice):
+        _fetch(m["url"], model_path(choice), (lambda fr, g, t: progress(0.06 + fr * 0.94, g, t)) if progress else None,
+               cancelled, m["size"])
+    return model_path(choice)
 
 
 def available() -> bool:
@@ -73,8 +175,8 @@ class Server:
             exe, model, libs = found
             self.stop_locked()
             if status:
-                status(L("Запускаю смысловой разбор (модель Qwen из VoiceType)",
-                         "Starting meaning analysis (Qwen model from VoiceType)"))
+                status(L(f"Запускаю смысловой разбор ({os.path.basename(model).split('-Q')[0]})",
+                         f"Starting meaning analysis ({os.path.basename(model).split('-Q')[0]})"))
             env = dict(os.environ)
             env["PATH"] = os.pathsep.join(libs + [env.get("PATH", "")])
             log = open(os.path.join(cache_dir(), "llm.log"), "w", encoding="utf-8", errors="replace")
@@ -159,6 +261,7 @@ def _ask(lines: list[str], a: int, b: int, lang: str) -> list[dict]:
     body = json.dumps({
         "messages": [{"role": "system", "content": SYSTEM_EN if en else SYSTEM_RU}, {"role": "user", "content": user}],
         "temperature": 0, "max_tokens": 900, "cache_prompt": True,
+        "chat_template_kwargs": {"enable_thinking": False},
         "response_format": {"type": "json_schema", "json_schema": {"name": "takes", "schema": SCHEMA}},
     }).encode("utf-8")
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions", data=body,
@@ -168,11 +271,73 @@ def _ask(lines: list[str], a: int, b: int, lang: str) -> list[dict]:
     return json.loads(out["choices"][0]["message"]["content"]).get("drop", [])
 
 
-def analyze(phrases: list[dict], lang: str = "ru", progress=None, cancelled=lambda: False) -> dict[int, dict]:
+PAIR_SYS_RU = ("Ты — опытный видеомонтажёр. Перед тобой кусок расшифровки черновой записи урока. Спикер часто "
+               "переговаривает: говорит мысль, а потом сразу говорит её же заново, другими словами или точнее, "
+               "иногда по частям. В монтаж идёт только последний вариант.")
+PAIR_TASK_RU = ("Фраза A: «{a}»\n\nДальше спикер говорит:\n{nexts}\n\n"
+                "Говорит ли спикер в одной из этих фраз ту же мысль, что во фразе A, заново (переговаривает A)? "
+                "Если да — укажи номер этой фразы. Если фраза A добавляет свою мысль, а следующие фразы её продолжают "
+                "или говорят о другом — ответь 0.")
+PAIR_SYS_EN = ("You are an experienced video editor. Below is part of a raw lesson transcript. The speaker often "
+               "re-records: says an idea and then says the same idea again, reworded or more precisely, sometimes "
+               "in parts. Only the last version goes into the edit.")
+PAIR_TASK_EN = ("Phrase A: \"{a}\"\n\nThen the speaker says:\n{nexts}\n\n"
+                "Does the speaker say the same idea as phrase A again in one of these phrases (re-recording A)? "
+                "If yes, give that phrase's number. If phrase A adds its own idea and the next phrases continue it "
+                "or talk about something else, answer 0.")
+PAIR_SCHEMA = {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
+PAIR_NEXT = 5          # сколько следующих фраз показываем
+PAIR_HORIZON = 90.0    # и не дальше стольких секунд
+
+
+def _pair_prompt(a: str, nexts: list[str], lang: str) -> str:
+    lst = "\n".join(f"{k + 1}. {t}" for k, t in enumerate(nexts))
+    return (PAIR_TASK_EN if lang == "en" else PAIR_TASK_RU).format(a=a, nexts=lst)
+
+
+def _ask_pair(phrases: list[dict], i: int, lang: str, examples: list[dict] | None = None) -> int | None:
+    """Номер (id) более поздней фразы, которая переговаривает фразу i, или None.
+    Точечный вопрос про одну фразу модель решает заметно точнее, чем «отметь лишнее в окне»
+    (проверено на ручном монтаже: 9B в окне помечает почти всё подряд)."""
+    p = phrases[i]
+    nx = [q for q in phrases[i + 1:i + 1 + PAIR_NEXT] if q["clip"] == p["clip"] and q["start"] - p["end"] < PAIR_HORIZON]
+    if not nx:
+        return None
+    en = lang == "en"
+    prev = " ".join(q["text"] for q in phrases[max(0, i - 2):i] if q["clip"] == p["clip"])
+    head = ""
+    if prev:
+        head = f"Before that: \"{prev}\"\n\n" if en else f"Перед этим: «{prev}»\n\n"
+    user = head + _pair_prompt(p["text"], [q["text"] for q in nx], lang)
+    # примеры решений самого монтажёра (из «Учиться на моих правках») — как прошлые ответы в диалоге.
+    # Проверено на отложенной половине записи: модель реже называет повтором то, что монтажёр оставляет
+    shots = []
+    for ex in examples or []:
+        shots += [{"role": "user", "content": _pair_prompt(ex["a"], ex["nexts"], lang)},
+                  {"role": "assistant", "content": json.dumps({"n": int(ex["n"])})}]
+    body = json.dumps({
+        "messages": [{"role": "system", "content": PAIR_SYS_EN if en else PAIR_SYS_RU}] + shots +
+                    [{"role": "user", "content": user}],
+        "temperature": 0, "max_tokens": 20, "cache_prompt": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "response_format": {"type": "json_schema", "json_schema": {"name": "pair", "schema": PAIR_SCHEMA}},
+    }).encode("utf-8")
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        out = json.loads(r.read().decode("utf-8"))
+    n = int(json.loads(out["choices"][0]["message"]["content"]).get("n", 0) or 0)
+    return nx[n - 1]["id"] if 1 <= n <= len(nx) else None
+
+
+def analyze(phrases: list[dict], lang: str = "ru", progress=None, cancelled=lambda: False,
+            examples: list[dict] | None = None) -> dict[int, dict]:
     """{id фразы: {"why": ..., "by": ...}} для фраз, которые модель предлагает убрать."""
     if not phrases:
         return {}
-    key = hashlib.sha1(json.dumps([PROMPT_VERSION, lang, [p["text"] for p in phrases]],
+    found = find()
+    mname = os.path.basename(found[1]) if found else ""
+    key = hashlib.sha1(json.dumps([PROMPT_VERSION, lang, mname, [p["text"] for p in phrases], examples or []],
                                   ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
     cpath = os.path.join(cache_dir(), f"llm_{key}.json")
     if os.path.isfile(cpath):
@@ -197,7 +362,7 @@ def analyze(phrases: list[dict], lang: str = "ru", progress=None, cancelled=lamb
         with lock:
             done[0] += 1
             if progress:
-                progress(done[0] / len(starts), L(f"Смысловой разбор: {done[0]} из {len(starts)}",
+                progress(0.5 * done[0] / len(starts), L(f"Смысловой разбор: {done[0]} из {len(starts)}",
                                                   f"Meaning analysis: {done[0]} of {len(starts)}"))
         ids = {p["id"] for p in win}
         zone = {p["id"] for p in phrases[a:b + 1]}
@@ -215,6 +380,30 @@ def analyze(phrases: list[dict], lang: str = "ru", progress=None, cancelled=lamb
     with ThreadPoolExecutor(max_workers=PARALLEL) as ex:
         for part in ex.map(one, starts):
             result.update(part)
+
+    # второй проход: про каждую фразу отдельно — переговорена ли она дальше. Дополняет первый:
+    # где первый проход не назвал фразу повтором, берём ответ второго (с номером замены)
+    done2 = [0]
+
+    def pair(i):
+        if cancelled():
+            return i, None
+        try:
+            r = _ask_pair(phrases, i, lang, examples)
+        except Exception:  # noqa: BLE001
+            r = None
+        with lock:
+            done2[0] += 1
+            if progress and done2[0] % 10 == 0:
+                progress(0.5 + 0.5 * done2[0] / n, L(f"Ищу переговорённые фразы: {done2[0]} из {n}",
+                                         f"Looking for re-recorded phrases: {done2[0]} of {n}"))
+        return i, r
+
+    with ThreadPoolExecutor(max_workers=PARALLEL) as ex:
+        for i, by in ex.map(pair, range(n)):
+            pid = phrases[i]["id"]
+            if by is not None and by > pid and (pid not in result or result[pid]["why"] != "repeat"):
+                result[pid] = {"why": "repeat", "by": by}
     if not cancelled():
         with open(cpath, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False)

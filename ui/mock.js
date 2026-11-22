@@ -85,6 +85,31 @@ const Mock = (() => {
       return true;
     },
     replan: async (s, o, wo) => plan(s, o, wo), set_quality: async () => true,
+    llm_status: async () => ({ choice: '9b', has_9b: true, has_4b: false, size_9b: 5.68e9, size_4b: 2.74e9, using: 'Qwen3.5-9B-Q4_K_M.gguf' }),
+    learn_info: async () => ({ llm: true, busy: false, report: null, projects: [
+      { path: 'E:\\Projects\\Курс\\04 AE 1\\00 PROJECTS\\AE 01.yaitserez', name: 'AE 01.yaitserez' },
+      { path: 'E:\\Projects\\Курс\\03 PR 2\\PR 02.yaitserez', name: 'PR 02.yaitserez' }] }),
+    learn_add: async () => [],
+    learn_cancel: async () => true,
+    learn_reset: async () => settings,
+    learn_start: async () => {
+      let f = 0;
+      const iv = setInterval(() => {
+        f += 0.2;
+        if (f < 1) return App.learnProgress({ fraction: f, message: 'AE 01: Ищу переговорённые фразы: 400 из 1084' });
+        clearInterval(iv);
+        App.learnDone({ settings, report: { date: '2026-11-22', changed: true, n_examples: 6, llm: true,
+          params: { takes_strictness: 'strict', pair_cov: 0.35, continuation_gap: 2.2 },
+          defaults: { takes_strictness: 'medium', pair_cov: 0.35, continuation_gap: 2.2 },
+          projects: [{ name: 'AE 01', source: 'premiere', source_file: 'AE 01.prproj', words: 8172,
+            before: { agree: 0.8435, extra: 1040, lost: 239, minutes: 43.8, target_minutes: 38.0 },
+            after: { agree: 0.8484, extra: 985, lost: 254, minutes: 43.2, target_minutes: 38.0,
+              extra_examples: ['Плюс я ещё туда завёз функцию, чтобы обновлять кадры…', 'Возвращаемся теперь в автор.'],
+              lost_examples: ['Это такая картинка, на которой изображена поверхность бумаги…'] } },
+          { name: 'test', error: 'итоговый монтаж слишком короткий (0.2 мин) — похоже на черновик, пропускаю' }] } });
+      }, 500);
+      return true;
+    },
   };
   return { api };
 })();

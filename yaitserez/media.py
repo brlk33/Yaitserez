@@ -78,6 +78,7 @@ class MediaInfo:
     video_codec: str = ""
     pix_fmt: str = ""
     profile: str = ""
+    audio_channels: list = field(default_factory=list)  # по числу аудиопотоков: каналы в каждом
     extra: dict = field(default_factory=dict)
 
     @property
@@ -120,6 +121,7 @@ def probe(path: str) -> MediaInfo:
     if a is not None:
         info.sample_rate = int(a.get("sample_rate") or 48000)
         info.channels = int(a.get("channels") or 2)
+    info.audio_channels = [int(s.get("channels") or 2) for s in streams if s.get("codec_type") == "audio"]
     info.creation_time = tags.get("creation_time")
     info.timecode = tags.get("timecode")
     return info

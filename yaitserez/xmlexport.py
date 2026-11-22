@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import re
 from urllib.parse import quote
 from xml.sax.saxutils import escape
 
@@ -64,6 +65,57 @@ class _Files:
                 f"{_rate(self.tb, self.ntsc)}<duration>{dur}</duration>{_tc(self.tb, self.ntsc)}<media>{media}</media></file>")
 
 
+def _ensure_streams(info: dict) -> None:
+    """Старые проекты не знают, сколько аудиопотоков в файле — дочитываем."""
+    if not info.get("has_audio") or info.get("audio_channels"):
+        return
+    try:
+        from .media import probe
+        info["audio_channels"] = probe(info["path"]).audio_channels or [info.get("channels") or 2]
+    except Exception:
+        info["audio_channels"] = [info.get("channels") or 2]
+
+
+def _stream_sources(sc: dict, out_dir: str) -> list[dict]:
+    """Звук скринкаста: [первый поток из самого файла, остальные непустые — отдельными WAV].
+    Premiere из MP4 читает только первый аудиопоток, поэтому дорожки OBS «звук компьютера» и т. п.
+    вынимаем в «<папка XML>/Звук скринкаста/». Пустые (тишина) пропускаем."""
+    if not sc.get("has_audio"):
+        return []
+    out = [sc]
+    chans = sc.get("audio_channels") or [sc.get("channels") or 2]
+    if len(chans) < 2:
+        return out
+    from .media import ffmpeg, run
+    silent = sc.setdefault("silent_streams", {})
+    folder = os.path.join(out_dir, L("Звук скринкаста", "Screen audio"))
+    for k in range(1, len(chans)):
+        if str(k) not in silent:
+            p = run([ffmpeg(), "-nostdin", "-vn", "-i", sc["path"], "-map", f"0:a:{k}", "-af", "volumedetect",
+                     "-f", "null", "-"])
+            txt = p.stderr.decode("utf-8", "replace")
+            mx = re.search(r"max_volume:\s*(-?[\d.]+|-inf) dB", txt)
+            silent[str(k)] = (mx is None) or mx.group(1) == "-inf" or float(mx.group(1)) < -60
+        if silent[str(k)]:
+            continue
+        wav = os.path.join(folder, f"{os.path.splitext(sc['name'])[0]} a{k + 1}.wav")
+        if not os.path.isfile(wav):
+            os.makedirs(folder, exist_ok=True)
+            run([ffmpeg(), "-nostdin", "-v", "error", "-y", "-i", sc["path"], "-map", f"0:a:{k}",
+                 "-c:a", "pcm_s16le", wav])
+        if os.path.isfile(wav):
+            out.append({"path": wav, "name": os.path.basename(wav), "duration": sc["duration"], "has_video": False,
+                        "has_audio": True, "sample_rate": sc.get("sample_rate") or 48000, "channels": chans[k],
+                        "stream": k})
+    return out
+
+
+def _track(items: list[str], channels: int) -> str:
+    kind = "Mono" if channels == 1 else "Stereo"
+    return (f'<track currentExplodedTrackIndex="0" totalExplodedTrackCount="1" premiereTrackType="{kind}">'
+            f"<enabled>TRUE</enabled><locked>FALSE</locked>{''.join(items)}</track>")
+
+
 def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Yaitserez") -> None:
     clips = analysis["clips"]
     mics = analysis["mics"]
@@ -78,9 +130,25 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
         return int(round(t * fps))
 
     v_items, a_mic, a_cam = [], [], []
-    v_tracks: dict[int, list[str]] = {}
     screens = analysis.get("screens") or []
     scr_on = "TRUE" if settings.get("screen_enabled", False) else "FALSE"
+    out_dir = os.path.dirname(os.path.abspath(path))
+    used = {s[0] for it in plan["timeline"] for s in it.get("scr") or []}
+    srcs = []
+    for i, sc in enumerate(screens):
+        if i in used:
+            _ensure_streams(sc)
+        srcs.append(_stream_sources(sc, out_dir) if i in used else [])
+    # дорожки видео скринкастов (V2…) и их звука (A3…): номер дорожки → порядок в XML
+    v_keys = sorted({sc.get("track", 0) for sc in screens})
+    a_keys = sorted({(sc.get("track", 0), src.get("stream", 0)) for sc, ss in zip(screens, srcs) for src in ss})
+    a_ch = {k: 2 for k in a_keys}
+    for sc, ss in zip(screens, srcs):
+        for src in ss:
+            if src["channels"] == 1:
+                a_ch[(sc.get("track", 0), src.get("stream", 0))] = 1
+    v_tracks = {t: [] for t in v_keys}
+    sa_tracks: dict[tuple, list[str]] = {k: [] for k in a_keys}
     markers = []
     pos = 0
     n = 0
@@ -157,10 +225,31 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
                 s_start, s_in = start - s_in, 0
             s_out = min(s_out, F(sc["duration"]))
             if s_out - s_in > 1:
-                v_tracks.setdefault(sc.get("track", 0), []).append(
-                    f'<clipitem id="clipitem-s{n}-{scr[0]}"><name>{escape(sc["name"])}</name><enabled>{scr_on}</enabled>'
-                    f"<duration>{F(sc['duration'])}</duration>{_rate(tb, ntsc)}<start>{s_start}</start>"
-                    f"<end>{s_start + (s_out - s_in)}</end><in>{s_in}</in><out>{s_out}</out>{files.ref(sc)}</clipitem>")
+                t = sc.get("track", 0)
+                s_end = s_start + (s_out - s_in)
+                base = f"clipitem-s{n}-{scr[0]}"
+                slinks = [(base, "video", 2 + v_keys.index(t), len(v_tracks[t]) + 1)]
+                ss = srcs[scr[0]]
+                n_str = len(ss)
+                for src in ss:
+                    k = src.get("stream", 0)
+                    slinks.append((f"{base}-a{k + 1}", "audio", 3 + a_keys.index((t, k)), len(sa_tracks[(t, k)]) + 1))
+                slink = "".join(
+                    f"<link><linkclipref>{ref}</linkclipref><mediatype>{mt}</mediatype><trackindex>{ti}</trackindex>"
+                    f"<clipindex>{ci}</clipindex>{'<groupindex>1</groupindex>' if mt == 'audio' else ''}</link>"
+                    for ref, mt, ti, ci in slinks) if n_str else ""
+                common = (f"<duration>{F(sc['duration'])}</duration>{_rate(tb, ntsc)}<start>{s_start}</start>"
+                          f"<end>{s_end}</end><in>{s_in}</in><out>{s_out}</out>")
+                v_tracks[t].append(
+                    f'<clipitem id="{base}"><name>{escape(sc["name"])}</name><enabled>{scr_on}</enabled>'
+                    f"{common}{files.ref(sc)}{slink}</clipitem>")
+                for src in ss:
+                    k = src.get("stream", 0)
+                    sa_tracks[(t, k)].append(
+                        f'<clipitem id="{base}-a{k + 1}"><name>{escape(src["name"])}</name><enabled>TRUE</enabled>'
+                        f"{common}{files.ref(src)}"
+                        f"<sourcetrack><mediatype>audio</mediatype><trackindex>1</trackindex></sourcetrack>"
+                        f"{slink}</clipitem>")
         if mic_xml:
             _, mic, m_in, m_out = mic_xml
             a_mic.append(
@@ -192,8 +281,11 @@ def export(path: str, analysis: dict, plan: dict, settings: dict, name: str = "Y
             f"<fielddominance>none</fielddominance></samplecharacteristics></format>")
     afmt = "<format><samplecharacteristics><depth>16</depth><samplerate>48000</samplerate></samplecharacteristics></format>"
     tracks_a = ""
-    for items in (a_mic, a_cam):
-        tracks_a += f"<track><enabled>TRUE</enabled><locked>FALSE</locked>{''.join(items)}</track>"
+    mic_ch = 1 if mics and all((m.get("channels") or 1) == 1 for m in mics) else 2
+    cam_ch = 1 if clips and all((c.get("channels") or 2) == 1 for c in clips) else 2
+    tracks_a += _track(a_mic, mic_ch) + _track(a_cam, cam_ch)
+    for k in a_keys:
+        tracks_a += _track(sa_tracks[k], a_ch[k])
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n<xmeml version="4">'
         f'<sequence id="sequence-1"><name>{escape(name)}</name><duration>{total}</duration>{_rate(tb, ntsc)}'

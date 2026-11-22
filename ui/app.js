@@ -93,6 +93,13 @@ function renderAppSettings() {
     S.settings.theme = th; applyTheme(th); api('save_settings', { theme: th });
   });
   renderModelCallout();
+  loadRecent();
+  segControl($('#asrSeg'), [['auto', 'GigaAM-v3'], ['whisper', 'Whisper']], S.settings.asr_engine || 'auto', (v) => {
+    S.settings.asr_engine = v; api('save_settings', { asr_engine: v });
+  });
+  $('#asrDesc').textContent = t(S.gigaam ? 'asr_desc' : 'asr_desc_none');
+  loadLlm();
+  loadLearn();
   renderHotkeys();
   $('#aboutLine').textContent = t('about', 'v' + (S.version || ''));
 }
@@ -168,7 +175,7 @@ async function toggleMax() {
 document.querySelectorAll('.winctl button').forEach((b) => b.addEventListener('click', () => {
   if (b.dataset.w === 'min') api('win_min');
   if (b.dataset.w === 'max') toggleMax();
-  if (b.dataset.w === 'close') api('win_close');
+  if (b.dataset.w === 'close') askClose();
 }));
 
 /* ---------- навигация ---------- */
@@ -492,7 +499,14 @@ window.addEventListener('drop', async (e) => {
   if (!files || !files.length) return;
   // WebView2 отдаёт настоящие пути файлов только через это сообщение (как в VoiceType)
   try { window.chrome.webview.postMessageWithAdditionalObjects('FilesDropped', files); } catch (err) { /* обычный браузер */ }
-  if (S.view === 'result' && S.analysis) { tracksAdded(await api('add_tracks_dropped')); return; }
+  if (S.view === 'result' && S.analysis) {
+    const fake = { getBoundingClientRect: () => ({ left: e.clientX, right: e.clientX, top: e.clientY, bottom: e.clientY }) };
+    openMenu(fake, t('drop_ask'), [
+      { label: t('drop_append'), sub: t('drop_append_d'), fn: () => appendSources(true) },
+      { label: t('drop_track'), sub: t('drop_track_d'), fn: async () => tracksAdded(await api('add_tracks_dropped')) },
+    ]);
+    return;
+  }
   if (S.view !== 'files') show('files');
   addResult(await api('take_dropped'));
 }, true);
@@ -663,6 +677,7 @@ function opResult(edl, op) {
 }
 function commit(newEdl, keepSel) {
   if (newEdl === S.edl) return;
+  markDirty();
   Edit.push(curState());
   S.edl = newEdl;
   S.manual = true;
@@ -687,6 +702,7 @@ function undo() { const st = Edit.back(curState()); if (st) { restoreState(st); 
 function redo() { const st = Edit.forward(curState()); if (st) { restoreState(st); toast(t('redone'), { ms: 900 }); } }
 /** Статус фраз: в автоматике — через пересчёт, в ручном монтаже — вставкой/удалением их кусков. */
 function setStatus(ps, st, noPush) {
+  markDirty();
   if (!S.manual) {
     if (!noPush) Edit.push(curState());
     for (const p of ps) { if (st === p.auto) delete S.overrides[p.id]; else S.overrides[p.id] = st; }
@@ -977,12 +993,13 @@ function renderTracks() {
   box.append(row('V1', an.clips.map((c) => c.name).join(', ')));
   for (const tr of Object.keys(byTrack).map(Number).sort((a, b) => a - b)) {
     const list = byTrack[tr];
-    const shown = S.settings.show_track === tr;
+    const view = S.settings.screen_view || 'cam';
+    const shown = view !== 'cam' && (S.settings.show_track >= 0 ? S.settings.show_track : 0) === tr;
     const eye = h('button', { class: 'icon-btn eye' + (shown ? ' on' : ''), html: shown ? ICON.eye : ICON.eyeOff, title: t('track_show') });
     eye.addEventListener('click', () => {
-      S.settings.show_track = shown ? -1 : tr;
-      api('save_settings', { show_track: S.settings.show_track });
-      renderTracks();
+      if (shown) { setScreenView('cam'); return; }
+      S.settings.show_track = tr;
+      setScreenView(view === 'cam' ? 'both' : view);
     });
     const bad = list.filter(([, sc]) => !sc.sync.ok).map(([, sc]) => sc.name);
     const note = bad.length ? h('span', { class: 'track-warn', title: t('track_unsynced') }, '⚠ ' + bad.join(', ')) : null;
@@ -991,7 +1008,9 @@ function renderTracks() {
   // небольшая отдельная кнопка справа — чтобы не нажать случайно, проводя мышью под таймлайном
   const add = h('button', { class: 'btn btn-secondary btn-sm track-add', title: t('add_track') }, h('span', { class: 'plus' }, '＋'), t('add_track_short'));
   add.addEventListener('click', async () => { add.disabled = true; tracksAdded(await api('add_tracks')); add.disabled = false; });
-  box.append(h('div', { class: 'track-foot' }, add));
+  const more = h('button', { class: 'btn btn-secondary btn-sm track-add', title: t('append_hint') }, h('span', { class: 'plus' }, '＋'), t('append_short'));
+  more.addEventListener('click', () => appendSources(false));
+  box.append(h('div', { class: 'track-foot' }, more, add));
 }
 function tracksAdded(res) {
   $('#dragOverlay').classList.remove('on');
@@ -1294,8 +1313,8 @@ $('#exportMore').addEventListener('click', (e) => {
   ]);
 });
 async function exportXml() {
-  const hasExtra = S.items.some((it) => it.lab || it.z);
-  const edl = S.manual || hasExtra ? S.items.map((it) => ({ clip: it.clip, in: it.in, out: it.out, phrases: it.phrases, lab: it.lab || null, z: it.z || null })) : null;
+  // всегда ровно то, что на таймлайне — с ручной нарезкой, метками и зумами
+  const edl = S.items.map((it) => ({ clip: it.clip, in: it.in, out: it.out, phrases: it.phrases, lab: it.lab || null, z: it.z || null }));
   const path = await api('export', edl);
   if (path) toast(t('saved'), { action: { label: t('show_folder'), fn: () => api('reveal', path) }, ms: 7000 });
 }
@@ -1306,18 +1325,38 @@ function renderProxyNote() {
   const light = S.settings.preview_quality === 'light', halfQ = S.settings.preview_quality === 'half';
   const n = halfQ ? clips.filter((c) => c.halfReady || c.audioOnly).length : light ? clips.filter((c) => c.lightReady).length : S.ready.filter(Boolean).length;
   $('#proxyNote').textContent = n < clips.length ? t(light ? 'light_progress' : 'proxies', n, clips.length) : '';
-  const hasScreens = false;  // дорожки теперь — в списке под таймлайном
-  $('#screenBtn').hidden = true;
+  // что показывать: камеру, скринкаст или оба сразу
+  const hasScreens = (S.analysis.screens || []).length > 0;
+  $('#screenBtn').hidden = !hasScreens;
   if (hasScreens) {
+    const v = S.settings.screen_view || 'cam';
     $('#screenBtn').innerHTML = '';
-    $('#screenBtn').classList.toggle('on', !!S.settings.show_screen);
-    $('#screenBtn').append(h('span', { html: ICON.screen, style: 'display:inline-flex' }), h('span', {}, t(S.settings.show_screen ? 'screen_on' : 'screen_off')));
+    $('#screenBtn').classList.toggle('on', v !== 'cam');
+    $('#screenBtn').append(h('span', { html: ICON.screen, style: 'display:inline-flex' }), h('span', {}, t('sv_' + v)), h('span', { html: ICON.chev }));
   }
+  applyScreenView();
   $('#qualityBtn').innerHTML = '';
   const q = S.settings.preview_quality || 'original';
   $('#qualityBtn').append(h('span', {}, t(q === 'light' ? 'q_light' : q === 'half' ? 'q_half' : 'q_orig')), h('span', { html: ICON.chev }));
 }
-$('#screenBtn').addEventListener('click', () => {
+function applyScreenView() {
+  const v = (S.analysis && (S.analysis.screens || []).length) ? (S.settings.screen_view || 'cam') : 'cam';
+  const pl = $('#player');
+  for (const k of ['cam', 'pip', 'screen', 'both', 'split']) pl.classList.toggle('v-' + k, v === k);
+}
+function setScreenView(v) {
+  S.settings.screen_view = v;
+  if (v !== 'cam' && !(S.settings.show_track >= 0)) S.settings.show_track = 0;   // какую дорожку экрана — первую
+  api('save_settings', { screen_view: v, show_track: S.settings.show_track });
+  renderProxyNote(); renderTracks();
+}
+$('#screenBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const cur = S.settings.screen_view || 'cam';
+  openMenu($('#screenBtn'), t('sv_title'), ['cam', 'screen', 'both', 'pip', 'split'].map((k) => ({
+    label: t('sv_' + k), sub: t('sv_' + k + '_d'), on: cur === k, fn: () => setScreenView(k) })));
+});
+$('#screenBtn').addEventListener('click_old', () => {
   S.settings.show_screen = !S.settings.show_screen;
   api('save_settings', { show_screen: S.settings.show_screen });
   renderProxyNote();
@@ -1630,10 +1669,12 @@ const Player = (() => {
   // запись экрана: тот же момент, что и у камеры (через время микрофона)
   const sv = $('#vidScreen');
   function syncScreen(it, d) {
-    const tr = S.settings.show_track;
-    const ent = tr != null && tr >= 0 && it && it.scr ? it.scr.find(([si]) => S.analysis.screens[si] && (S.analysis.screens[si].track || 0) === tr) : null;
+    const view = S.settings.screen_view || 'cam';
+    const tr = S.settings.show_track >= 0 ? S.settings.show_track : 0;
+    const ent = view !== 'cam' && it && it.scr ? it.scr.find(([si]) => S.analysis.screens[si] && (S.analysis.screens[si].track || 0) === tr) : null;
     const on = ent && S.analysis.screens[ent[0]].direct;
     sv.classList.toggle('on', !!on);
+    $('#player').classList.toggle('has-screen', !!on);   // нет экрана в этом куске — показываем камеру как обычно
     if (!on) { if (!sv.paused) sv.pause(); return; }
     const si = ent[0];
     if (sv.dataset.si !== String(si)) { sv.dataset.si = String(si); sv.src = MOCKED ? '' : `/screen/${si}`; }
@@ -2142,7 +2183,7 @@ const ZoomPanel = (() => {
     Player.refreshZoom();
     TL.redraw();
   }
-  function endZ() { dragUndo = false; renderEDL(false); renderEditState(); }
+  function endZ() { dragUndo = false; markDirty(); renderEDL(false); renderEditState(); }
   /** Автозум через клип: обычный план — крупный — обычный… Короткие куски и склейки внутри фразы план не меняют. */
   function auto() {
     const st = S.settings;
@@ -2313,6 +2354,81 @@ $('#hkReset').addEventListener('click', () => {
   renderHotkeys(); renderTools();
 });
 
+
+/* ---------- проекты: Ctrl+S — сохранить нарезку, потом открыть и продолжить ---------- */
+S.dirty = false; S.projectName = null;
+const markDirty = () => { if (S.analysis) { S.dirty = true; renderProjTitle(); } };
+function renderProjTitle() {
+  const b = $('#saveProjBtn');
+  if (!b) return;
+  b.classList.toggle('dirty', !!S.dirty);
+  b.title = (S.projectName || t('proj_unsaved')) + (S.dirty ? ' •' : '');
+}
+const uiState = () => ({ edl: S.edl, autoEdl: S.autoEdl, manual: S.manual, overrides: S.overrides, wordOverrides: S.wordOverrides,
+  marks: S.marks, time: Player.time(), view: TL.view() });
+async function saveProject(saveAs) {
+  if (!S.analysis) return false;
+  const r = await api('save_project', uiState(), null, !!saveAs);
+  if (!r) return false;
+  S.dirty = false; S.projectName = r.name; renderProjTitle();
+  toast(t('proj_saved', r.name), { ms: 1800 });
+  loadRecent();
+  return true;
+}
+async function openProject(path) {
+  const r = await api('open_project', path || null);
+  if (!r) return;
+  if (r.error) { toast(r.error, { error: true, ms: 8000 }); return; }
+  S.settings = r.settings;
+  await App.done({ restore: r.ui });
+  S.projectName = r.name; S.dirty = false; renderProjTitle();
+  const files = await api('init');
+  S.files = (files && files.files) || S.files;
+  renderFiles();
+}
+function restoreUi(ui) {
+  if (!ui) return;
+  S.overrides = ui.overrides || {}; S.wordOverrides = ui.wordOverrides || {}; S.marks = ui.marks || {};
+  if (ui.manual && ui.edl && ui.edl.length) { S.manual = true; S.edl = ui.edl; S.autoEdl = ui.autoEdl || edlFromPlan(S.plan); }
+  renderEDL(true);
+  if (ui.view) TL.setView(ui.view.v0, ui.view.vd);
+  if (ui.time != null) Player.seek(Math.min(ui.time, Math.max(0, S.dur - 0.05)), false);
+}
+async function loadRecent() {
+  const list = await api('recent_projects');
+  const box = $('#recentList');
+  if (!box) return;
+  box.innerHTML = '';
+  $('#projects').classList.toggle('empty', !(list && list.length));
+  for (const p of list || []) {
+    const row = h('div', { class: 'proj-row', title: p.path }, h('span', { class: 'em' }, '🥚'), h('span', { class: 'proj-name' }, p.name.replace(/\.yaitserez$/i, '')));
+    row.addEventListener('click', () => openProject(p.path));
+    box.append(row);
+  }
+}
+$('#saveProjBtn').addEventListener('click', () => saveProject(false));
+$('#openProjBtn').addEventListener('click', () => openProject());
+// закрытие с несохранённой нарезкой — спрашиваем
+function askClose() {
+  if (!S.dirty || !S.analysis) { api('win_close'); return; }
+  $('#closeAsk').hidden = false;
+}
+$('#closeCancel').addEventListener('click', () => { $('#closeAsk').hidden = true; });
+$('#closeDiscard').addEventListener('click', () => { S.dirty = false; api('win_close'); });
+$('#closeSave').addEventListener('click', async () => { if (await saveProject(false)) api('win_close'); else $('#closeAsk').hidden = true; });
+
+/* ---------- дозаписанные исходники — в конец монтажа ---------- */
+async function appendSources(dropped) {
+  const r = await api(dropped ? 'append_dropped' : 'append_sources');
+  if (!r) return;
+  if (!r.started) { toast(t('append_none'), { ms: 3500 }); return; }
+  S.appending = true;
+  S.busy = true; S.busyFrac = 0; renderModelState();
+  renderSteps(false);
+  $('#progressTitle') && ($('#progressTitle').textContent = t('append_title'));
+  show('progress');
+}
+
 /* ---------- масштаб интерфейса: Ctrl + / Ctrl − / Ctrl 0 / Ctrl + колесо ---------- */
 const ZOOMS = [0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.4, 1.6];
 function applyZoom(z, announce) {
@@ -2343,8 +2459,9 @@ const RUN = {
   find: () => { document.querySelector('.side-tab[data-tab="text"]').click(); $('#searchInput').focus(); $('#searchInput').select(); },
   export: () => exportXml(),
   ui_zoom_in: () => stepZoom(1), ui_zoom_out: () => stepZoom(-1), ui_zoom_reset: () => applyZoom(1, true),
+  save_project: () => saveProject(false), save_project_as: () => saveProject(true), open_project: () => openProject(),
 };
-const ANYWHERE = new Set(['ui_zoom_in', 'ui_zoom_out', 'ui_zoom_reset']);
+const ANYWHERE = new Set(['ui_zoom_in', 'ui_zoom_out', 'ui_zoom_reset', 'open_project']);
 let capturingKey = null;
 document.addEventListener('keydown', (e) => {
   if (capturingKey) return;
@@ -2399,6 +2516,8 @@ const App = {
   modelState({ state, error }) { S.modelState = state; S.modelError = error; renderModelState(); },
   async done(payload) {
     const data = payload && payload.analysis ? payload : await (await fetch('/api/result?' + Date.now())).json();
+    const restore = payload && payload.restore;
+    S.projectName = null; S.dirty = false; renderProjTitle();
     STEPS.forEach((id) => { stepState[id] = { cls: 'done', frac: 1, msg: '' }; const el = $('#step-' + id); if (el) el.className = 'step done'; });
     Player.reset();
     S.analysis = data.analysis;
@@ -2423,7 +2542,43 @@ const App = {
       show('result');
       renderSettings($('#liveSettings'), SETTINGS_LIVE, onLiveSetting);
       renderResult(true);
-    }, 300);
+      if (restore) restoreUi(restore);
+    }, restore ? 0 : 300);
+  },
+  // дозаписанные исходники разобраны: добавляем в конец, ручная работа остаётся
+  async appended({ added }) {
+    const data = await (await fetch('/api/result?' + Date.now())).json();
+    S.appending = false; S.busy = false; renderModelState();
+    Edit.push(curState());
+    S.analysis = data.analysis;
+    S.plan = data.plan;
+    indexPhrases();
+    WAVES = (data.wave || []).map((b64) => { const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; });
+    S.ready = S.analysis.clips.map((c, i) => S.ready[i] || !!c.ready);
+    const fresh = edlFromPlan(S.plan);
+    if (S.manual && S.autoEdl) { S.edl = Edit.rebase(S.autoEdl, S.edl, fresh); S.autoEdl = fresh; }
+    show('result');
+    renderResult(true);
+    markDirty();
+    toast(t('append_done', added), { action: { label: t('k_undo'), fn: undo }, ms: 6000 });
+  },
+  appendFailed({ message }) {
+    S.appending = false; S.busy = false; renderModelState();
+    show('result');
+    toast(message, { error: true, ms: 8000 });
+  },
+  learnProgress(d) { LEARN.prog = d; LEARN.busy = true; renderLearn(); },
+  learnDone(d) {
+    LEARN.busy = false; LEARN.prog = null;
+    if (d.report) { LEARN.report = d.report; if (d.settings) S.settings = d.settings; toast(t('learn_done')); }
+    else if (d.error) toast(d.error, { error: true, ms: 8000 });
+    else if (d.cancelled) toast(t('cancelled'));
+    renderLearn();
+  },
+  llmProgress(d) { llmProg = d; renderLlm(); },
+  llmDone({ error, status }) {
+    llmProg = null; LLM = status; renderLlm();
+    if (error) toast(error, { error: true, ms: 7000 }); else toast(t('llm_ready'));
   },
   proxyReady({ clip, error, light }) {
     if (!S.analysis) return;
@@ -2445,6 +2600,7 @@ window.App = App;
 function onMainSetting() { api('save_settings', S.settings); }
 let liveUndoArmed = true;
 function onLiveSetting(key, dragging) {
+  markDirty();
   // одна запись в истории на одно движение ползунка; ручной монтаж не сбрасывается
   if (liveUndoArmed) { Edit.push(curState()); renderEditState(); }
   liveUndoArmed = !dragging;
@@ -2467,6 +2623,120 @@ function restoreAnchor(an) {
   }
   if (best != null) TL.setView(an.v.v0 + (best - an.g), an.v.vd);
 }
+/* ---------- нейросеть для разбора дублей: 9B точнее, 4B меньше места ---------- */
+let LLM = null, llmProg = null;
+const gb = (b) => (b / 1e9).toFixed(1).replace('.', LANG === 'ru' ? ',' : '.') + (LANG === 'ru' ? ' ГБ' : ' GB');
+async function loadLlm() { LLM = await api('llm_status'); renderLlm(); }
+function renderLlm() {
+  const box = $('#llmBox');
+  if (!box || !LLM) return;
+  box.innerHTML = '';
+  for (const k of ['9b', '4b']) {
+    const on = LLM.choice === k, has = LLM['has_' + k];
+    const pick = h('button', { class: 'radio' + (on ? ' on' : '') });
+    const row = h('div', { class: 'set-row llm-row' + (on ? ' on' : '') }, pick,
+      h('div', { class: 'set-text' }, h('div', { class: 'set-label' }, t('llm_' + k)), h('div', { class: 'set-desc' }, t('llm_' + k + '_d', gb(LLM['size_' + k])))));
+    if (has) row.append(h('span', { class: 'tag green' }, t('llm_have')));
+    else if (llmProg && llmProg.choice === k) {
+      const bar = h('div', { class: 'llm-bar' }, h('div', { class: 'llm-fill', style: `width:${Math.round(llmProg.fraction * 100)}%` }));
+      const stop = h('button', { class: 'btn btn-ghost btn-sm' }, t('llm_stop'));
+      stop.addEventListener('click', () => api('cancel_llm_download'));
+      row.append(h('div', { class: 'llm-prog' }, bar, h('span', { class: 'hint' }, `${gb(llmProg.got)} / ${gb(llmProg.total || LLM['size_' + k])}`)), stop);
+    } else {
+      const dl = h('button', { class: 'btn btn-secondary btn-sm', disabled: !!llmProg }, t('llm_download', gb(LLM['size_' + k])));
+      dl.addEventListener('click', async () => { llmProg = { choice: k, fraction: 0, got: 0, total: LLM['size_' + k] }; renderLlm(); if (!(await api('download_llm', k))) { llmProg = null; renderLlm(); } });
+      row.append(dl);
+    }
+    const choose = async () => { if (!on) { LLM = await api('set_llm', k); renderLlm(); } };
+    pick.addEventListener('click', choose);
+    row.querySelector('.set-text').addEventListener('click', choose);
+    box.append(row);
+  }
+  const using = LLM.using ? t('llm_using', LLM.using.replace(/\.gguf$/, '')) : t('llm_none');
+  box.append(h('div', { class: 'hint llm-note' }, using));
+}
+/* ---------- учимся на ручном монтаже ---------- */
+const LEARN = { projects: [], picked: new Set(), report: null, llm: false, useLlm: true, busy: false, prog: null };
+async function loadLearn() {
+  const d = await api('learn_info');
+  if (!d) return;
+  LEARN.projects = d.projects; LEARN.report = d.report; LEARN.llm = d.llm; LEARN.busy = d.busy;
+  LEARN.picked = new Set(d.projects.map((p) => p.path));
+  renderLearn();
+}
+const pct = (x) => (x * 100).toFixed(1).replace('.', LANG === 'ru' ? ',' : '.') + '%';
+function renderLearn() {
+  const box = $('#learnBox');
+  if (!box) return;
+  box.innerHTML = '';
+  box.append(h('p', { class: 'set-desc learn-intro' }, t('learn_d')));
+  const list = h('div', { class: 'learn-list' });
+  if (!LEARN.projects.length) list.append(h('div', { class: 'hint' }, t('learn_none')));
+  for (const p of LEARN.projects) {
+    const on = LEARN.picked.has(p.path);
+    const sw = h('button', { class: 'switch' + (on ? ' on' : '') });
+    const row = h('div', { class: 'set-row click' + (LEARN.busy ? ' disabled' : '') }, sw,
+      h('div', { class: 'set-text' }, h('div', { class: 'set-label' }, p.name.replace(/\.yaitserez$/i, '')), h('div', { class: 'set-desc learn-path' }, p.path)));
+    row.addEventListener('click', () => { if (on) LEARN.picked.delete(p.path); else LEARN.picked.add(p.path); renderLearn(); });
+    list.append(row);
+  }
+  box.append(list);
+  const add = h('button', { class: 'btn btn-ghost btn-sm', disabled: LEARN.busy }, t('learn_add'));
+  add.addEventListener('click', async () => {
+    const more = await api('learn_add');
+    for (const p of more || []) { if (!LEARN.projects.some((x) => x.path === p.path)) LEARN.projects.push(p); LEARN.picked.add(p.path); }
+    renderLearn();
+  });
+  const opts = h('div', { class: 'learn-actions' }, add);
+  if (LEARN.llm) {
+    const sw = h('button', { class: 'switch' + (LEARN.useLlm ? ' on' : '') });
+    const lab = h('div', { class: 'learn-opt' + (LEARN.busy ? ' disabled' : '') }, sw, h('span', {}, t('learn_llm')));
+    lab.addEventListener('click', () => { if (!LEARN.busy) { LEARN.useLlm = !LEARN.useLlm; renderLearn(); } });
+    opts.append(lab);
+  }
+  box.append(opts);
+  if (LEARN.busy) {
+    const p = LEARN.prog || { fraction: 0, message: t('learn_start') };
+    const stop = h('button', { class: 'btn btn-ghost btn-sm' }, t('llm_stop'));
+    stop.addEventListener('click', () => api('learn_cancel'));
+    box.append(h('div', { class: 'learn-prog' },
+      h('div', { class: 'llm-bar learn-bar' }, h('div', { class: 'llm-fill', style: `width:${Math.round((p.fraction || 0) * 100)}%` })),
+      h('span', { class: 'hint' }, p.message), stop));
+  } else {
+    const go = h('button', { class: 'btn btn-primary', disabled: !LEARN.picked.size }, t('learn_go'));
+    go.addEventListener('click', async () => {
+      LEARN.busy = true; LEARN.prog = null; renderLearn();
+      if (!(await api('learn_start', [...LEARN.picked], LEARN.llm && LEARN.useLlm))) { LEARN.busy = false; renderLearn(); toast(t('learn_busy'), { error: true }); }
+    });
+    box.append(h('div', { class: 'learn-go' }, go, h('span', { class: 'hint' }, t(LEARN.llm && LEARN.useLlm ? 'learn_time_llm' : 'learn_time'))));
+  }
+  if (LEARN.report) box.append(learnReport(LEARN.report));
+}
+function learnReport(r) {
+  const el = h('div', { class: 'learn-report' });
+  el.append(h('div', { class: 'set-label' }, t('learn_report', r.date)));
+  if (r.changed) {
+    const ch = Object.keys(r.params).filter((k) => r.params[k] !== r.defaults[k]).map((k) => t('learn_p_' + k, r.params[k]));
+    el.append(h('div', { class: 'set-desc' }, t('learn_changed'), h('ul', {}, ch.map((x) => h('li', {}, x)))));
+  } else el.append(h('div', { class: 'set-desc' }, t('learn_same')));
+  if (r.n_examples) el.append(h('div', { class: 'set-desc' }, t('learn_examples', r.n_examples)));
+  for (const p of r.projects) {
+    if (p.error) { el.append(h('div', { class: 'learn-proj' }, h('b', {}, p.name), h('span', { class: 'hint' }, ' — ' + p.error))); continue; }
+    const b = p.before, a = p.after, up = a.agree - b.agree;
+    const card = h('div', { class: 'learn-proj' },
+      h('div', { class: 'learn-head' }, h('b', {}, p.name),
+        h('span', { class: 'tag ' + (up > 0.0005 ? 'green' : up < -0.0005 ? 'red' : 'gray') }, `${pct(b.agree)} → ${pct(a.agree)}`)),
+      h('div', { class: 'set-desc' }, t(p.source === 'premiere' ? 'learn_src_pr' : 'learn_src_ya', p.source_file)),
+      h('div', { class: 'set-desc' }, t('learn_nums', b.extra, a.extra, b.lost, a.lost, a.minutes, a.target_minutes)));
+    const more = (title, items) => (items && items.length ? h('details', { class: 'learn-more' }, h('summary', {}, title), h('ul', {}, items.map((x) => h('li', {}, x)))) : null);
+    card.append(...[more(t('learn_extra'), a.extra_examples), more(t('learn_lost'), a.lost_examples)].filter(Boolean));
+    el.append(card);
+  }
+  const reset = h('button', { class: 'btn btn-ghost btn-sm' }, t('learn_reset'));
+  reset.addEventListener('click', async () => { S.settings = await api('learn_reset'); LEARN.report = null; renderLearn(); toast(t('learn_reset_done')); });
+  el.append(reset);
+  return el;
+}
 function renderModelCallout() {
   const c = $('#modelCallout');
   const parts = t(S.model ? 'model_vt' : 'model_dl');
@@ -2482,6 +2752,7 @@ function renderModelCallout() {
   S.settings = st.settings;
   S.files = st.files || [];
   S.model = st.model;
+  S.gigaam = st.gigaam;
   S.version = st.version;
   S.modelState = st.modelState;
   applyTheme(S.settings.theme || 'system');   // источник правды — настройки программы, а не память браузера

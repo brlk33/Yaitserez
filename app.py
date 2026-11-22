@@ -22,7 +22,11 @@ from yaitserez.winctl import WinCtl, native_hwnd
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_DIR = os.path.join(HERE, "ui")
 SETTINGS_PATH = os.path.join(app_dir(), "settings.json")
-VERSION = "1.0.0"
+try:
+    with open(os.path.join(HERE, "version.txt"), encoding="utf-8-sig") as _f:
+        VERSION = _f.read().strip() or "1.0.0"
+except OSError:
+    VERSION = "1.0.0"
 
 DEFAULTS = {
     "remove_silence": True,
@@ -48,6 +52,10 @@ DEFAULTS = {
     "takes_strictness": "medium",
     "hotkey_preset": "premiere",
     "snapping": True,
+    "llm_model": "9b",
+    "asr_engine": "auto",
+    "recent_projects": [],
+    "screen_view": "cam",
     "xml_names": "source",
     "zoom_a": 100, "zoom_b": 115, "zoom_bx": 0, "zoom_by": 0, "zoom_min": 1.0, "zoom_inside": True,
     "breath_mode": "all",
@@ -61,6 +69,7 @@ DEFAULTS = {
     "model": "large-v3-turbo",
     "theme": "system",
     "ui_lang": "ru",
+    "learned": None,     # «Учиться на моих правках»: {"params", "examples", "report"}
 }
 
 
@@ -84,6 +93,10 @@ FIXED = {"equalize": True, "pause_place": "auto", "smart_takes": True, "prefer_t
          "camera_audio": "muted", "keep_silent_clips": False, "screen_enabled": False}
 
 
+DL: dict = {}
+LEARN: dict = {"busy": False, "cancel": False}
+
+
 class State:
     def __init__(self):
         self.files: dict[str, object] = {}
@@ -96,6 +109,7 @@ class State:
         self.cancel = False
         self.busy = False
         self.class_key = None
+        self.project_path = None
         self.model_state = "loading"
         self.model_error = ""
         self.result_json = b"{}"
@@ -289,6 +303,7 @@ class Api:
             "settings": STATE.settings,
             "version": VERSION,
             "model": "VoiceType" if local else None,
+            "gigaam": __import__("yaitserez.transcribe", fromlist=["x"]).gigaam_available(),
             "files": [file_public(k, v) for k, v in STATE.files.items()],
         }
 
@@ -357,7 +372,7 @@ class Api:
         return True
 
     def start(self, settings: dict):
-        if STATE.busy:
+        if STATE.busy or LEARN["busy"]:
             return False
         self.save_settings(settings)
         STATE.cancel = False
@@ -371,6 +386,7 @@ class Api:
 
     def _run(self):
         try:
+            STATE.project_path = None   # новая обработка — новый проект
             files = list(STATE.files.values())
             videos = [f for f in files if f.kind == "video"]
             mics = [f for f in files if f.kind == "audio"]
@@ -450,21 +466,270 @@ class Api:
     def _classify(self):
         """Разбор дублей зависит только от двух настроек — пересчитываем лишь при их смене."""
         key = (STATE.settings.get("drop_bad_takes"), STATE.settings.get("prefer_take"),
-               STATE.settings.get("takes_strictness"))
+               STATE.settings.get("takes_strictness"),
+               json.dumps((STATE.settings.get("learned") or {}).get("params"), sort_keys=True))
         if key != STATE.class_key:
             pipeline.classify(STATE.analysis, STATE.settings)
             STATE.class_key = key
+
+    # --- проекты: нарезка сохраняется в файл .yaitserez и открывается потом ---
+    def save_project(self, ui: dict, path: str | None = None, save_as: bool = False):
+        import pickle
+        import zipfile
+
+        an = STATE.analysis
+        if not an:
+            return None
+        path = path or STATE.project_path
+        if save_as or not path:
+            first = an["clips"][0]["path"] if an["clips"] else os.path.expanduser("~")
+            folder = os.path.dirname(first)
+            name = os.path.basename(folder) or "Yaitserez"
+            res = WINDOW.create_file_dialog(webview.FileDialog.SAVE, directory=folder,
+                                            save_filename=f"{name}.yaitserez",
+                                            file_types=(L("Проект Яйцереза", "Yaitserez project") + " (*.yaitserez)",))
+            if not res:
+                return None
+            path = res if isinstance(res, str) else res[0]
+            if not path.lower().endswith(".yaitserez"):
+                path += ".yaitserez"
+        keep = {k: v for k, v in an.items() if k not in ("proxies", "more_proxies", "_breaths", "_onsets", "_offsets")}
+        meta = {"format": 1, "version": VERSION, "ui": ui,
+                "files": [{"path": f.path, "kind": f.kind} for f in STATE.files.values()],
+                "settings": {k: v for k, v in STATE.settings.items() if k not in ("recent_projects", "hotkeys", "learned")}}
+        tmp = path + ".tmp"
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            z.writestr("project.json", json.dumps(meta, ensure_ascii=False))
+            z.writestr("analysis.pkl", pickle.dumps(keep, protocol=pickle.HIGHEST_PROTOCOL))
+        os.replace(tmp, path)
+        STATE.project_path = path
+        self._remember(path)
+        return {"path": path, "name": os.path.basename(path)}
+
+    def _remember(self, path: str):
+        rec = [p for p in STATE.settings.get("recent_projects") or [] if p != path and os.path.isfile(p)]
+        self.save_settings({"recent_projects": [path] + rec[:7]})
+
+    def recent_projects(self):
+        return [{"path": p, "name": os.path.basename(p)} for p in STATE.settings.get("recent_projects") or []
+                if os.path.isfile(p)]
+
+    def open_project(self, path: str | None = None):
+        import pickle
+        import zipfile
+
+        if STATE.busy:
+            return {"error": L("Сейчас идёт обработка", "Processing is running")}
+        if not path:
+            res = WINDOW.create_file_dialog(webview.FileDialog.OPEN,
+                                            file_types=(L("Проект Яйцереза", "Yaitserez project") + " (*.yaitserez)",))
+            if not res:
+                return None
+            path = res if isinstance(res, str) else res[0]
+        try:
+            with zipfile.ZipFile(path) as z:
+                meta = json.loads(z.read("project.json").decode("utf-8"))
+                an = pickle.loads(z.read("analysis.pkl"))
+        except Exception as e:  # noqa: BLE001
+            return {"error": L(f"Не удалось открыть проект: {e}", f"Could not open the project: {e}")}
+        missing = [c["path"] for c in an["clips"] + an["mics"] if not os.path.isfile(c["path"])]
+        if missing:
+            return {"error": L("Не найдены исходники: ", "Source files not found: ") + ", ".join(os.path.basename(m) for m in missing[:4])}
+        STATE.files.clear()
+        self.add_paths([f["path"] for f in meta.get("files", [])])
+        kinds = {f["path"]: f["kind"] for f in meta.get("files", [])}
+        for info in STATE.files.values():
+            info.kind = kinds.get(info.path, info.kind)
+        ui = meta.get("ui") or {}
+        STATE.overrides = {str(k): v for k, v in (ui.get("overrides") or {}).items()}
+        STATE.word_overrides = {str(k): v for k, v in (ui.get("wordOverrides") or {}).items()}
+        STATE.trims = {}
+        STATE.class_key = None
+        for k in ("remove_silence", "pause", "cut_breaths", "breath_sens", "breath_mode", "drop_bad_takes",
+                  "takes_strictness", "keep_alternates", "cut_profanity", "cut_fillers", "cut_words", "language"):
+            if k in (meta.get("settings") or {}):
+                STATE.settings[k] = meta["settings"][k]
+        self.save_settings({})
+
+        def on_proxy(i, n, total, err, light=False):
+            push("proxyReady", {"clip": i, "done": n, "total": total, "error": err, "light": light})
+        an["proxies"] = pipeline.ProxyQueue(an["clips"], an["mics"], on_proxy, lambda: False,
+                                            light=STATE.settings.get("preview_quality") == "light")
+        STATE.analysis = an
+        self._classify()
+        plan = cutter.build_plan(an, STATE.settings, STATE.overrides, STATE.word_overrides, STATE.trims)
+        STATE.result_json = json.dumps({"analysis": pipeline.public_analysis(an), "plan": plan,
+                                        "wave": waveforms(an), "waveFps": WAVE_FPS},
+                                       ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        STATE.project_path = path
+        self._remember(path)
+        return {"ok": True, "ui": ui, "path": path, "name": os.path.basename(path), "settings": STATE.settings}
+
+    # --- дозаписанные исходники: в конец готового монтажа ---
+    def append_sources(self, paths: list | None = None):
+        if not STATE.analysis or STATE.busy:
+            return None
+        if paths is None:
+            res = WINDOW.create_file_dialog(
+                webview.FileDialog.OPEN, allow_multiple=True,
+                file_types=(L("Видео и звук", "Video and audio") +
+                            " (*.mp4;*.mov;*.mxf;*.mts;*.m2ts;*.avi;*.mkv;*.m4v;*.wav;*.mp3;*.m4a;*.aac;*.flac)",))
+            paths = list(res or [])
+        known = {c["path"] for c in STATE.analysis["clips"]} | {m["path"] for m in STATE.analysis["mics"]} \
+            | {s["path"] for s in STATE.analysis.get("screens") or []}
+        before = set(STATE.files)
+        self.add_paths([p for p in paths if os.path.abspath(p) not in known])
+        new = [STATE.files[k] for k in STATE.files if k not in before]
+        videos = [f for f in new if f.kind == "video"]
+        mics = [f for f in new if f.kind == "audio"]
+        screens = [f for f in new if f.kind == "screen"]
+        if not videos and not mics:
+            return {"added": 0}
+        STATE.busy = True
+        STATE.cancel = False
+        threading.Thread(target=self._append_run, args=(videos, mics, screens), daemon=True).start()
+        return {"started": True, "videos": len(videos), "mics": len(mics), "screens": len(screens)}
+
+    def append_dropped(self):
+        import time
+
+        from webview.dom import _dnd_state
+
+        for _ in range(20):
+            if _dnd_state["paths"]:
+                break
+            time.sleep(0.05)
+        paths = [p for _, p in _dnd_state["paths"]]
+        _dnd_state["paths"].clear()
+        return self.append_sources(paths)
+
+    def _append_run(self, videos, mics, screens):
+        try:
+            def on_proxy(i, n, total, err, light=False):
+                push("proxyReady", {"clip": i, "done": n, "total": total, "error": err, "light": light})
+            n = pipeline.append_sources(STATE.analysis, videos, mics, screens, STATE.settings,
+                                        lambda st, fr, msg: push("progress", {"stage": st, "fraction": fr, "message": msg}),
+                                        lambda: STATE.cancel, on_proxy)
+            STATE.class_key = None
+            self._classify()
+            plan = cutter.build_plan(STATE.analysis, STATE.settings, STATE.overrides, STATE.word_overrides, STATE.trims)
+            STATE.result_json = json.dumps({"analysis": pipeline.public_analysis(STATE.analysis), "plan": plan,
+                                            "wave": waveforms(STATE.analysis), "waveFps": WAVE_FPS},
+                                           ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            push("appended", {"added": n})
+        except pipeline.Cancelled:
+            push("appendFailed", {"message": L("Остановлено", "Stopped")})
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            push("appendFailed", {"message": str(e)})
+        finally:
+            STATE.busy = False
 
     def set_quality(self, q: str):
         """«original» — исходник + звук микрофона; «light» — лёгкие копии 540p со звуком внутри."""
         q = q if q in ("light", "half") else "original"
         self.save_settings({"preview_quality": q})
         an = STATE.analysis
-        if an and an.get("proxies"):
+        for pq in ([an.get("proxies")] + list(an.get("more_proxies") or [])) if an else []:
+            if pq is None:
+                continue
             if q == "light":
-                an["proxies"].request_light()
+                pq.request_light()
             elif q == "half":
-                an["proxies"].request_half()
+                pq.request_half()
+        return True
+
+    # --- модель для разбора дублей ---
+    # --- учимся на ручном монтаже ---
+    def learn_info(self):
+        """Проекты, на которых можно учиться (недавние и открытый), и прошлый отчёт."""
+        from yaitserez import llm
+        paths = [STATE.project_path] if STATE.project_path else []
+        paths += [p for p in STATE.settings.get("recent_projects") or [] if p not in paths]
+        llm.CHOICE["model"] = STATE.settings.get("llm_model", "9b")
+        learned = STATE.settings.get("learned") or {}
+        return {"projects": [{"path": p, "name": os.path.basename(p)} for p in paths if p and os.path.isfile(p)],
+                "report": learned.get("report"), "llm": llm.available(), "busy": LEARN["busy"]}
+
+    def learn_add(self):
+        res = WINDOW.create_file_dialog(webview.FileDialog.OPEN, allow_multiple=True,
+                                        file_types=(L("Проект Яйцереза", "Yaitserez project") + " (*.yaitserez)",))
+        return [{"path": p, "name": os.path.basename(p)} for p in (res or [])]
+
+    def learn_start(self, paths: list, use_llm: bool = True):
+        from yaitserez import learn
+        if LEARN["busy"] or STATE.busy or not paths:
+            return False
+        LEARN.update(busy=True, cancel=False)
+
+        def work():
+            from yaitserez import transcribe as tr
+            if use_llm:
+                tr.release()  # видеопамять — под языковую модель
+            try:
+                res = learn.run(list(paths), dict(STATE.settings),
+                                progress=lambda fr, msg: push("learnProgress", {"fraction": fr, "message": msg}),
+                                cancelled=lambda: LEARN["cancel"], use_llm=bool(use_llm))
+                self.save_settings({"learned": res, "takes_strictness": res["params"]["takes_strictness"]})
+                push("learnDone", {"report": res["report"], "settings": STATE.settings})
+            except learn.Cancelled:
+                push("learnDone", {"cancelled": True})
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                push("learnDone", {"error": str(e)})
+            finally:
+                from yaitserez import llm
+                llm.SERVER.stop()
+                if use_llm:
+                    tr.preload(STATE.settings["model"])
+                LEARN["busy"] = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def learn_cancel(self):
+        LEARN["cancel"] = True
+        return True
+
+    def learn_reset(self):
+        self.save_settings({"learned": None, "takes_strictness": "medium"})
+        return STATE.settings
+
+    def llm_status(self):
+        from yaitserez import llm
+        llm.CHOICE["model"] = STATE.settings.get("llm_model", "9b")
+        return {**llm.status(), "busy": bool(DL.get("busy"))}
+
+    def set_llm(self, choice: str):
+        from yaitserez import llm
+        if choice not in llm.MODELS:
+            return False
+        self.save_settings({"llm_model": choice})
+        llm.CHOICE["model"] = choice
+        llm.SERVER.stop()      # следующий разбор запустит выбранную модель
+        STATE.class_key = None
+        return self.llm_status()
+
+    def download_llm(self, choice: str):
+        from yaitserez import llm
+        if DL.get("busy") or choice not in llm.MODELS:
+            return False
+        DL.update(busy=True, cancel=False)
+
+        def run():
+            err = None
+            try:
+                llm.download(choice, lambda fr, g, t: push("llmProgress", {"choice": choice, "fraction": fr, "got": g, "total": t}),
+                             lambda: DL.get("cancel"))
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+            DL.update(busy=False)
+            push("llmDone", {"choice": choice, "error": err, "status": self.llm_status()})
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def cancel_llm_download(self):
+        DL["cancel"] = True
         return True
 
     def set_lang(self, lang: str):

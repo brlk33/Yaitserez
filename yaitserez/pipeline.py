@@ -48,7 +48,7 @@ def _clip_dict(v: MediaInfo) -> dict:
     return {
         "path": v.path, "name": v.name, "duration": v.duration, "has_video": v.has_video, "has_audio": v.has_audio,
         "width": v.width, "height": v.height, "fps_num": v.fps_num, "fps_den": v.fps_den,
-        "sample_rate": v.sample_rate, "channels": v.channels, "direct": browser_playable(v),
+        "sample_rate": v.sample_rate, "channels": v.channels, "audio_channels": v.audio_channels, "direct": browser_playable(v),
     }
 
 
@@ -324,6 +324,9 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
     model = settings.get("model", "large-v3-turbo")
     lang = settings.get("language", "ru")
     need_speech = settings.get("remove_silence", True) or settings.get("drop_bad_takes", True)
+    # русская речь — GigaAM-v3 (точнее Whisper, с пунктуацией и временем слов), если он есть; иначе Whisper
+    use_giga = lang == "ru" and settings.get("asr_engine", "auto") != "whisper" and tr.gigaam_available()
+    engine = "gigaam-v3" if use_giga else model
 
     def source(c):
         s = c["sync"]
@@ -358,7 +361,7 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
             if not need_speech or src_sig == "none":
                 words_by_clip.append([])
                 continue
-            wc = os.path.join(cache_dir(), "words_" + _key(_file_sig(c["path"]), src_sig, model, lang, 4) + ".json")
+            wc = os.path.join(cache_dir(), "words_" + _key(_file_sig(c["path"]), src_sig, engine, lang, 4) + ".json")
             if os.path.isfile(wc):
                 with open(wc, encoding="utf-8") as f:
                     words_by_clip.append(json.load(f))
@@ -367,16 +370,33 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
             msg = L(f"Распознаю речь: {c['name']} ({i + 1} из {len(clips)})",
                     f"Transcribing: {c['name']} ({i + 1} of {len(clips)})")
             progress("speech", base, msg)
-            ws = tr.transcribe(
-                audio, model, lang,
-                status=lambda m, base=base: progress("speech", base, m),
-                on_progress=lambda fr, base=base, span=span, msg=msg: (check(), progress("speech", base + fr * span, msg)),
-            )
+            ws = None
+            if use_giga:
+                try:
+                    tr.release()   # видеопамять — GigaAM
+                    ws = tr.transcribe_gigaam(
+                        audio, cache_dir(),
+                        status=lambda m, base=base: progress("speech", base, msg + " · GigaAM-v3"),
+                        on_progress=lambda fr, base=base, span=span, msg=msg: (check(), progress("speech", base + fr * span, msg + " · GigaAM-v3")),
+                    )
+                except Cancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 — не вышло — распознаём Whisper
+                    progress("speech", base, L(f"GigaAM недоступен ({e}), распознаю Whisper", f"GigaAM unavailable ({e}), using Whisper"))
+                    use_giga, engine = False, model
+                    wc = os.path.join(cache_dir(), "words_" + _key(_file_sig(c["path"]), src_sig, engine, lang, 4) + ".json")
+            if ws is None:
+                ws = tr.transcribe(
+                    audio, model, lang,
+                    status=lambda m, base=base: progress("speech", base, m),
+                    on_progress=lambda fr, base=base, span=span, msg=msg: (check(), progress("speech", base + fr * span, msg)),
+                )
             with open(wc, "w", encoding="utf-8") as f:
                 json.dump(ws, f, ensure_ascii=False)
             words_by_clip.append(ws)
     finally:
         loader.shutdown(wait=False, cancel_futures=True)
+        tr.gigaam_stop()   # освобождаем видеопамять для языковой модели
     progress("speech", 1.0, L("Речь распознана", "Speech transcribed"))
     check()
 
@@ -389,12 +409,14 @@ def analyze(videos: list[MediaInfo], mics: list[MediaInfo], settings: dict, prog
     if settings.get("drop_bad_takes", True) and settings.get("smart_takes", True) and phrases:
         from . import llm
 
+        llm.CHOICE["model"] = settings.get("llm_model", "9b")
         if llm.available():
             tr.release()  # освобождаем видеопамять под языковую модель
             try:
                 hints = llm.analyze(phrases, "en" if lang == "en" else "ru",
                                     progress=lambda fr, msg: (check(), progress("takes", fr, msg)),
-                                    cancelled=cancelled)
+                                    cancelled=cancelled,
+                                    examples=(settings.get("learned") or {}).get("examples") or None)
             except Cancelled:
                 raise
             except Exception as e:  # noqa: BLE001 — без модели работаем на правилах
@@ -456,6 +478,67 @@ def assign_tracks(extra: list[dict]) -> None:
             ends.append((sp[0], sp[2]))
 
 
+def append_sources(old: dict, videos: list[MediaInfo], mics: list[MediaInfo], screens: list[MediaInfo],
+                   settings: dict, progress, cancelled, on_proxy=None) -> int:
+    """Дозаписанные исходники — в конец уже готового разбора: синхронизация, распознавание и разбор
+    дублей только для новых файлов, потом всё склеивается в один разбор (новые клипы — после старых).
+    Возвращает, сколько клипов добавлено."""
+    from .media import probe
+
+    nc, nw, n_ph = len(old["clips"]), len(old["words"]), len(old["phrases"])
+    audio_only = bool(old["clips"]) and all(c.get("audio_only") for c in old["clips"])
+    known = {m["path"] for m in old["mics"]}
+    fresh_mics = [m for m in mics if m.path not in known]
+    if audio_only:
+        # проект только со звуком: новые записи — новые клипы
+        new = analyze([], fresh_mics, settings, progress, cancelled,
+                      on_proxy=(lambda i, *a, **k: on_proxy(i + nc, *a, **k)) if on_proxy else None)
+        mic_offset = len(old["mics"])
+    else:
+        # камеры синхронизируем со всеми записями микрофона: и старыми, и новыми
+        all_mics = [probe(m["path"]) for m in old["mics"]] + fresh_mics
+        new = analyze(videos, all_mics, settings, progress, cancelled,
+                      on_proxy=(lambda i, *a, **k: on_proxy(i + nc, *a, **k)) if on_proxy else None,
+                      screens=screens)
+        mic_offset = 0
+    # склейка разборов
+    for c in new["clips"]:
+        if mic_offset and c["sync"].get("mic") is not None:
+            c["sync"] = {**c["sync"], "mic": c["sync"]["mic"] + mic_offset}
+        old["clips"].append(c)
+    if mic_offset:
+        old["mics"] += new["mics"]
+    else:
+        old["mics"] = new["mics"]       # тот же список, только длиннее
+    for s in new.get("screens") or []:
+        if mic_offset and s["sync"].get("mic") is not None:
+            s["sync"] = {**s["sync"], "mic": s["sync"]["mic"] + mic_offset}
+        old.setdefault("screens", []).append(s)
+    for w in new["words"]:
+        w["clip"] += nc
+        w["phrase"] += n_ph
+        old["words"].append(w)
+    for p in new["phrases"]:
+        p["id"] += n_ph
+        p["clip"] += nc
+        p["words"] = [i + nw for i in p["words"]]
+        if "group" in p:
+            p["group"] += n_ph
+        old["phrases"].append(p)
+    for key in ("env", "thr", "low", "peaks", "per", "vad"):
+        old.setdefault(key, [None] * nc)
+        old[key] = list(old[key]) + list(new.get(key) or [None] * len(new["clips"]))
+    hints = dict(old.get("llm") or {})
+    for k, v in (new.get("llm") or {}).items():
+        hints[int(k) + n_ph] = {**v, "by": (v["by"] + n_ph) if isinstance(v.get("by"), int) else v.get("by")}
+    old["llm"] = hints
+    old.setdefault("more_proxies", []).append(new.get("proxies"))
+    for k in ("_breaths", "_onsets", "_offsets"):
+        old.pop(k, None)
+    classify(old, settings)          # дубли — по всему материалу: новый дубль может заменить старый
+    return len(new["clips"])
+
+
 def add_extra(analysis: dict, files: list[MediaInfo], progress=None) -> list[dict]:
     """Добавить видео на дополнительные дорожки уже после обработки: синхронизация по микрофону,
     без повторного распознавания речи."""
@@ -483,9 +566,12 @@ def public_screens(analysis: dict) -> list[dict]:
 
 
 def classify(analysis: dict, settings: dict) -> None:
+    # пороги, выученные на ручном монтаже («Учиться на моих правках»), если есть
+    learned = (settings.get("learned") or {}).get("params") or {}
+    extra = {k: learned[k] for k in ("pair_cov", "continuation_gap") if k in learned}
     takes.classify(analysis["words"], analysis["phrases"], enabled=settings.get("drop_bad_takes", True),
                    prefer=settings.get("prefer_take", "last"), llm=analysis.get("llm"),
-                   strictness=settings.get("takes_strictness", "medium"))
+                   strictness=settings.get("takes_strictness", "medium"), **extra)
 
 
 def public_analysis(analysis: dict) -> dict:

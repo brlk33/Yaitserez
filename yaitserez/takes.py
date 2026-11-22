@@ -30,6 +30,14 @@ JUNK = {
     "stop", "again", "sorry", "okay", "ok", "one", "more", "time", "take", "uhm", "erm", "hmm", "wait", "hold",
     "on", "let", "me", "start", "over", "redo", "cut", "damn", "oops", "sec", "second", "like", "so", "well",
 }
+# реплики самому себе / в сторону: «ладно, заново скажу», «если чё, вырежу», «зря я это записал».
+# Выучено на ручном монтаже: такие фразы всегда уходили целиком, а не только мат в них.
+ASIDE = re.compile(
+    r"(заново скаж|скажу заново|скажу ещё раз|ещё раз скаж|давай заново|похуй заново|"
+    r"вырежу|потом вырежу|если ч[её],? вырежу|зря (я )?(это )?(вообще )?записал|потом допишу|"
+    r"наговорю|подзаеб|заебал|продолжаем хайп|^дальше идём,? погнали|^вроде вс[её] запустил|"
+    r"^а,? я понял|^а,? нет|^ой|^так,? стоп|^стоп|"
+    r"let me (say|do) (it|that) again|i'?ll cut (it|this)|start over)")
 LEGIT_DOUBLES = {"да", "нет", "очень", "ну", "так", "ага", "вот", "давай", "very", "no", "yes"}
 STOP = HANGING | {"я", "мы", "ты", "вы", "он", "она", "они", "мне", "нам", "все", "всё", "ну", "вот", "да"}
 
@@ -37,6 +45,10 @@ STOP = HANGING | {"я", "мы", "ты", "вы", "он", "она", "они", "м�
 def norm(w: str) -> str:
     w = w.lower().replace("ё", "е")
     return re.sub(r"[^\w-]+", "", w).strip("-")
+
+
+# «э-э», «эм», «м-м»: колебание, а не конец мысли (GigaAM их честно записывает, часто с многоточием)
+HESITATION = re.compile(r"(э+|м+|хм+|а+м+|э+м+|аа+|ы+м*)(-[аэм]+)*")
 
 
 def build_phrases(words_by_clip: list[list[dict]], gap: float = 1.0) -> tuple[list[dict], list[dict]]:
@@ -63,7 +75,10 @@ def build_phrases(words_by_clip: list[list[dict]], gap: float = 1.0) -> tuple[li
                 if prev is not None:
                     words[prev]["w"] += w["w"]
                 continue
-            if prev is not None and (TERMINAL.search(words[prev]["w"]) or w["s"] - words[prev]["e"] > gap):
+            # после «э-э…» фраза продолжается, если говорящий заговорил снова в пределах 3 секунд
+            hes = prev is not None and HESITATION.fullmatch(words[prev]["n"])
+            if prev is not None and ((TERMINAL.search(words[prev]["w"]) and not hes)
+                                     or w["s"] - words[prev]["e"] > (3.0 if hes else gap)):
                 close(cur)
                 cur = []
             idx = len(words)
@@ -124,8 +139,21 @@ def _ratio(a: list[str], b: list[str]) -> float:
     return SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
+LEAD = {"а", "и", "ну", "вот", "но", "да", "так", "and", "so", "well", "but"}
+
+
+def _core(t: list[str]) -> list[str]:
+    """Без вводных «а», «и», «ну» в начале и без «э-э» — дубль часто начинают по-разному."""
+    t = [x for x in t if not HESITATION.fullmatch(x)]
+    k = 0
+    while k < len(t) - 2 and t[k] in LEAD:
+        k += 1
+    return t[k:]
+
+
 def _similar(a: list[str], b: list[str]) -> bool:
     """b — повтор (дубль) фразы a?"""
+    a, b = _core(a), _core(b)
     if not a or not b:
         return False
     if a == b:
@@ -201,7 +229,8 @@ def _prefix_of(p: dict, q: dict) -> bool:
 
 def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, prefer: str = "last",
              strictness: str = "medium",
-             window: int = 12, max_distance: float = 150.0, llm: dict | None = None) -> None:
+             window: int = 12, max_distance: float = 150.0, llm: dict | None = None,
+             continuation_gap: float = 2.2, pair_cov: float = 0.35) -> None:
     """Проставляет каждой фразе auto-статус: main / alt / bad и причину.
 
     Фраза убирается, если её ЗАМЕНЯЕТ более поздняя: дословный дубль, перефраз (смысловые слова
@@ -219,6 +248,7 @@ def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, pr
         p["reason"] = None
         p["take"] = 1
         p["takes"] = 1
+        p.pop("joins_next", None)
     if not enabled:
         return
     n = len(phrases)
@@ -237,6 +267,12 @@ def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, pr
         why = _cut_off(p, words)
         if not why and all(t in JUNK or is_profane(t) for t in p["tokens"]):
             why = ["junk"]
+        text = " ".join(p["tokens"])
+        if not why and len(p["tokens"]) <= 10 and ASIDE.search(text):
+            why = ["offscript"]
+        # короткая реплика с матом («Угу, похуй.», «Ага, похуй.») — уходит целиком, не только мат
+        if not why and len(p["tokens"]) <= 4 and any(is_profane(t) for t in p["tokens"]):
+            why = ["offscript"]
         hint = llm.get(p["id"])
         if not why and hint and not _stems(p["tokens"]):
             why = ["offscript"]  # модель считает лишней, а смысловых слов нет вообще («вот как-то так нужно»)
@@ -252,6 +288,7 @@ def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, pr
 
     # 2. замены: кто какую фразу перекрывает позже
     replaced_by: dict[int, int] = {}
+    idx0 = {p["id"]: k for k, p in enumerate(phrases)}
     for i, p in enumerate(phrases):
         if p["id"] in bad and bad[p["id"]][0] in ("junk", "offscript"):
             continue
@@ -279,8 +316,35 @@ def classify(words: list[dict], phrases: list[dict], *, enabled: bool = True, pr
                 if cov >= need + 0.05 and shared >= max(2, min(need_n + 1, n_stems)):
                     best = q["id"]
                     break
+        # модель прямо назвала более позднюю фразу, которая переговаривает эту: верим, если у них есть
+        # общие смысловые слова (одна модель ошибается часто, вместе со словами — редко)
+        if best is None and hint and hint.get("why") == "repeat" and isinstance(hint.get("by"), int):
+            q = phrases[idx0[hint["by"]]] if hint["by"] in idx0 else None
+            if q is not None and q["id"] > p["id"] and q["id"] not in bad:
+                cov, sh = _coverage(p, [q], weight)
+                if cov >= pair_cov and sh >= 1:
+                    best = q["id"]
         if best is not None:
             replaced_by[p["id"]] = best
+
+    # 2. пауза посреди предложения: «…для переноса я использую» → «AUX-плагин.» — фраза не брошена,
+    #    следующая её продолжает. Выучено на ручном монтаже: такие «оборванные» фразы почти всегда
+    #    возвращали в монтаж. Не трогаем, если следующая фраза начинает ту же мысль заново.
+    for k, p in enumerate(phrases[:-1]):
+        why = bad.get(p["id"])
+        if not why or why[0] not in ("hanging", "unfinished") or p["id"] in replaced_by or len(p["tokens"]) < 2:
+            continue
+        q = phrases[k + 1]
+        if q["clip"] != p["clip"] or q["start"] - p["end"] > continuation_gap:
+            continue
+        qb = bad.get(q["id"])
+        if qb and qb[0] in ("junk", "offscript", "cutoff"):
+            continue
+        a, b = _core(p["tokens"]), _core(q["tokens"])
+        if not b or (a[:1] == b[:1] and not q["text"][:1].islower()) or _similar(p["tokens"], q["tokens"])                 or _prefix_of(p, q):
+            continue
+        del bad[p["id"]]
+        p["joins_next"] = True
 
     idx = {p["id"]: k for k, p in enumerate(phrases)}
     # средне и строго: цепочку, переговорённую ещё раз, видим всегда (это безопасно)

@@ -229,6 +229,7 @@ const Keys = (() => {
     ['undo', 'k_undo'], ['redo', 'k_redo'], ['select_all', 'k_select_all'], ['deselect', 'k_deselect'],
     ['zoom_in', 'k_zoom_in'], ['zoom_out', 'k_zoom_out'], ['zoom_fit', 'k_zoom_fit'],
     ['find', 'k_find'], ['export', 'k_export'], ['ui_zoom_in', 'k_ui_zoom_in'], ['ui_zoom_out', 'k_ui_zoom_out'], ['ui_zoom_reset', 'k_ui_zoom_reset'],
+    ['save_project', 'k_save_project'], ['save_project_as', 'k_save_project_as'], ['open_project', 'k_open_project'],
   ];
   const PRESETS = {
     premiere: {
@@ -242,6 +243,7 @@ const Keys = (() => {
       undo: ['Ctrl+Z'], redo: ['Ctrl+Shift+Z'], select_all: ['Ctrl+A'], deselect: ['Ctrl+Shift+A', 'Escape'],
       zoom_in: ['='], zoom_out: ['-'], zoom_fit: ['\\'],
       find: ['Ctrl+F'], export: ['Ctrl+M'], ui_zoom_in: ['Ctrl+='], ui_zoom_out: ['Ctrl+-'], ui_zoom_reset: ['Ctrl+0'],
+      save_project: ['Ctrl+S'], save_project_as: ['Ctrl+Shift+S'], open_project: ['Ctrl+O'],
     },
     resolve: {
       play: ['Space'], play_fwd: ['L'], stop: ['K'], play_back: ['J'],
@@ -254,6 +256,7 @@ const Keys = (() => {
       undo: ['Ctrl+Z'], redo: ['Ctrl+Shift+Z'], select_all: ['Ctrl+A'], deselect: ['Ctrl+Shift+A', 'Escape'],
       zoom_in: ['Ctrl+='], zoom_out: ['Ctrl+-'], zoom_fit: ['Shift+Z'],
       find: ['Ctrl+F'], export: ['Ctrl+Shift+E'], ui_zoom_in: ['Ctrl+Alt+='], ui_zoom_out: ['Ctrl+Alt+-'], ui_zoom_reset: ['Ctrl+Alt+0'],
+      save_project: ['Ctrl+S'], save_project_as: ['Ctrl+Shift+S'], open_project: ['Ctrl+O'],
     },
   };
   const CODE = {

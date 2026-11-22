@@ -145,3 +145,130 @@ def transcribe(audio16k: np.ndarray, model_name: str, language: str | None, stat
         if on_progress and total > 0:
             on_progress(min(1.0, seg.end / total))
     return words
+
+
+# ---------------- GigaAM-v3: русский точнее Whisper ----------------
+def _voicetype_roots():
+    for base in (r"D:\Program Files", r"C:\Program Files", r"E:\Program Files",
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+        yield os.path.join(base, "VoiceType")
+
+
+def gigaam_find() -> tuple[str, str] | None:
+    """(python VoiceType с пакетом gigaam, папка с моделью v3_e2e_rnnt) или None."""
+    for root in _voicetype_roots():
+        py = os.path.join(root, ".venv", "Scripts", "python.exe")
+        mdir = os.path.join(root, "models")
+        if os.path.isfile(py) and os.path.isfile(os.path.join(mdir, "v3_e2e_rnnt.ckpt")) \
+                and os.path.isdir(os.path.join(root, ".venv", "Lib", "site-packages", "gigaam")):
+            return py, mdir
+    return None
+
+
+_GIGA = {"proc": None}
+
+
+def _giga_proc(py: str, mdir: str):
+    """Один процесс на всю обработку: модель грузится один раз (~20 с), дальше клипы идут подряд."""
+    import subprocess
+    import sys as _sys
+
+    p = _GIGA["proc"]
+    if p is not None and p.poll() is None:
+        return p
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gigaam_worker.py")
+    flags = 0x08000000 if _sys.platform == "win32" else 0
+    from .paths import cache_dir
+    log_path = os.path.join(cache_dir(), "gigaam.log")
+    log = open(log_path, "w", encoding="utf-8", errors="replace")   # не в трубу: полная труба остановила бы процесс
+    p = subprocess.Popen([py, "-u", worker, mdir], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                         text=True, encoding="utf-8", errors="replace", creationflags=flags)
+    p.log_path = log_path
+    while True:
+        line = p.stdout.readline()
+        if not line:
+            raise RuntimeError("GigaAM: " + _tail(log_path))
+        if line.startswith("READY"):
+            break
+    _GIGA["proc"] = p
+    return p
+
+
+def _tail(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()[-400:]
+    except OSError:
+        return ""
+
+
+def gigaam_stop() -> None:
+    p = _GIGA["proc"]
+    _GIGA["proc"] = None
+    if p is not None and p.poll() is None:
+        try:
+            p.stdin.write("QUIT" + chr(10))
+            p.stdin.flush()
+            p.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            p.kill()
+
+
+def gigaam_available() -> bool:
+    return gigaam_find() is not None
+
+
+def transcribe_gigaam(audio16k: np.ndarray, workdir: str, status=None, on_progress=None) -> list[dict]:
+    """Режем запись на куски речи (Silero VAD, до 20 с — столько GigaAM берёт за раз) и распознаём
+    GigaAM-v3 с пунктуацией и временем каждого слова. Работает в отдельном процессе питона VoiceType."""
+    import json
+    import subprocess
+    import sys as _sys
+
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    found = gigaam_find()
+    if not found:
+        raise RuntimeError("GigaAM не найден")
+    py, mdir = found
+    sr = 16000
+    ts = get_speech_timestamps(audio16k, VadOptions(max_speech_duration_s=20, min_silence_duration_ms=250,
+                                                     speech_pad_ms=250))
+    segs = [[round(t["start"] / sr, 3), round(t["end"] / sr, 3)] for t in ts]
+    if not segs:
+        return []
+    os.makedirs(workdir, exist_ok=True)
+    a_path, s_path, o_path = (os.path.join(workdir, n) for n in ("gigaam_audio.npy", "gigaam_segs.json", "gigaam_out.json"))
+    np.save(a_path, audio16k.astype(np.float32))
+    with open(s_path, "w", encoding="utf-8") as f:
+        json.dump(segs, f)
+    if status:
+        status("GigaAM-v3")
+    p = _giga_proc(py, mdir)
+    for pth in (o_path,):
+        if os.path.isfile(pth):
+            os.remove(pth)
+    p.stdin.write(f"{a_path}|{s_path}|{o_path}" + chr(10))
+    p.stdin.flush()
+    while True:
+        line = p.stdout.readline()
+        if not line:
+            gigaam_stop()
+            raise RuntimeError("GigaAM: " + _tail(getattr(p, "log_path", "")))
+        if line.startswith("P ") and on_progress:
+            try:
+                on_progress(float(line[2:]))
+            except ValueError:
+                pass
+        elif line.startswith("DONE"):
+            break
+        elif line.startswith("ERR"):
+            raise RuntimeError("GigaAM: " + line[4:].strip())
+    with open(o_path, encoding="utf-8") as f:
+        words = json.load(f)
+    for pth in (a_path, s_path, o_path):
+        try:
+            os.remove(pth)
+        except OSError:
+            pass
+    return words

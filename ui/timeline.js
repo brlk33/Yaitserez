@@ -371,17 +371,40 @@ function createTimeline(o) {
     return { zone: 'track', row, linked, i, edge: best <= EDGE ? edge : null, x, y, t };
   }
   const tool = () => o.tool();
+  /* Курсоры как в Premiere: у каждого инструмента свой значок; у края клипа — скобка
+     (красная — подрезка, жёлтая — подрезка со сдвигом), у склейки для «сдвига» — двойная скобка. */
+  const svgCur = (body, hx, hy, fb) => `url("data:image/svg+xml;utf8,${encodeURIComponent(
+    `<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'>${body}</svg>`)}") ${hx} ${hy}, ${fb}`;
+  const OUT = "stroke='#fff' stroke-width='3.2' stroke-linejoin='round' stroke-linecap='round' fill='none'";
+  const bracket = (dir, col) => {   // dir: 1 — «[» (начало клипа), -1 — «]» (конец)
+    const x = 12, d = dir * 4;
+    const path = `M${x + d} 5H${x}V19H${x + d}`;
+    const arr = dir > 0 ? 'M5 12H10M7.5 9.5L10 12L7.5 14.5' : 'M19 12H14M16.5 9.5L14 12L16.5 14.5';
+    return svgCur(`<path d='${path}' ${OUT}/><path d='${arr}' ${OUT}/><path d='${path}' stroke='${col}' stroke-width='2' fill='none'/>`
+      + `<path d='${arr}' stroke='${col}' stroke-width='1.6' fill='none' stroke-linecap='round'/>`, 12, 12, dir > 0 ? 'w-resize' : 'e-resize');
+  };
+  const CUR = {
+    trimIn: bracket(1, '#e5484d'), trimOut: bracket(-1, '#e5484d'),
+    rippleIn: bracket(1, '#f5c518'), rippleOut: bracket(-1, '#f5c518'),
+    roll: svgCur(`<path d='M10 5H12V19H10M14 5H12M14 19H12' ${OUT}/><path d='M10 5H12V19H10M14 5H12M14 19H12' stroke='#e5484d' stroke-width='2' fill='none'/>`
+      + `<path d='M3 12H7M5 10L3 12L5 14M21 12H17M19 10L21 12L19 14' ${OUT}/><path d='M3 12H7M5 10L3 12L5 14M21 12H17M19 10L21 12L19 14' stroke='#e5484d' stroke-width='1.6' fill='none' stroke-linecap='round'/>`, 12, 12, 'col-resize'),
+    razor: svgCur(`<g transform='rotate(-40 12 12)'><rect x='4' y='9' width='16' height='6' rx='1' fill='#fff' stroke='#111' stroke-width='1.2'/><path d='M8 12H16' stroke='#111' stroke-width='1.4'/></g>`
+      + `<path d='M3 21L6 18' stroke='#111' stroke-width='1.6'/>`, 3, 21, 'crosshair'),
+    slip: svgCur(`<path d='M5 6V18M19 6V18M8 12H16M10 10L8 12L10 14M14 10L16 12L14 14' ${OUT}/><path d='M5 6V18M19 6V18M8 12H16M10 10L8 12L10 14M14 10L16 12L14 14' stroke='#111' stroke-width='1.6' fill='none' stroke-linecap='round'/>`, 12, 12, 'ew-resize'),
+  };
   function cursorFor(h) {
-    if (!h || h.zone === 'head' || h.zone === 'empty') return 'default';
+    if (!h || h.zone === 'head' || h.zone === 'empty') return tool() === 'razor' ? CUR.razor : 'default';
     if (h.zone === 'ruler') return 'col-resize';
     const tl = tool();
     if (tl === 'hand') return 'grab';
     if (tl === 'zoom') return 'zoom-in';
-    if (tl === 'track_fwd' || tl === 'track_back') return h.i >= 0 ? (tl === 'track_fwd' ? 'e-resize' : 'w-resize') : 'default';
-    if (tl === 'razor') return h.i >= 0 && h.linked ? 'crosshair' : 'default';
-    if (h.edge && h.linked && (tl === 'select' || tl === 'ripple')) return h.edge.side === 'in' ? 'w-resize' : 'e-resize';
-    if (h.edge && h.linked && tl === 'roll') return 'col-resize';
-    if (h.i >= 0 && h.linked && (tl === 'slip' || tl === 'slide')) return 'ew-resize';
+    if (tl === 'razor') return CUR.razor;
+    if (h.edge && h.linked && tl === 'select') return h.edge.side === 'in' ? CUR.trimIn : CUR.trimOut;
+    if (h.edge && h.linked && tl === 'ripple') return h.edge.side === 'in' ? CUR.rippleIn : CUR.rippleOut;
+    if (h.edge && h.linked && tl === 'roll') return CUR.roll;
+    if (tl === 'slip') return h.i >= 0 && h.linked ? CUR.slip : 'default';
+    if (tl === 'ripple') return h.i >= 0 ? CUR.rippleOut : 'default';
+    if (tl === 'roll') return CUR.roll;
     return 'default';
   }
   // магнит: включён кнопкой (Shift на время перетаскивания — наоборот)
