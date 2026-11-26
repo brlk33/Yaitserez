@@ -658,6 +658,9 @@ kbd {
 .tool.on { background: var(--bg); color: var(--blue); box-shadow: 0 0 0 1px var(--border-strong); }
 .tool:disabled { opacity: .35; cursor: default; background: transparent; }
 .tool-sep { width: 1px; height: 16px; background: var(--border-strong); margin: 0 4px; }
+.tool.tool-text { width: auto; padding: 0 8px 0 6px; gap: 5px; white-space: nowrap; font: inherit; font-size: 12px; }
+.tl-bar { container-type: inline-size; }
+@container (max-width: 820px) { .tool.tool-text { width: 28px; padding: 0; } .tool.tool-text span { display: none; } }
 .tl-bar .tl-legend { flex: 1; }
 
 /* ===== только звук ===== */

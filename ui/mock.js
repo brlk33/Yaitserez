@@ -85,6 +85,20 @@ const Mock = (() => {
       return true;
     },
     replan: async (s, o, wo) => plan(s, o, wo), set_quality: async () => true,
+    reanalyze: async (s, o, wo, ids) => {
+      for (let k = 1; k <= 4; k++) { await new Promise((r) => setTimeout(r, 250)); App.reanalyzeProgress({ fraction: k / 4, message: '' }); }
+      for (const id of ids.slice(0, 2)) phrases[id].auto = 'bad';   // «нейросеть» передумала про пару фраз
+      return { plan: plan(s, o, wo), dropped: Math.min(2, ids.length) };
+    },
+    check_update: async () => ({ version: '1.4.0', notes: '' }), install_update: async () => false,
+    style_pick: async () => 'E:\\Projects\\Курс\\AE 01 финал.xml',
+    style_start: async () => {
+      setTimeout(() => App.styleDone({ settings: Object.assign(settings, { pause: 0.18, cut_breaths: true, style_ref: {
+        file: 'AE 01 финал.xml', sequence: 'AE 01', cuts: 142, pause: 0.18, pause_lo: 0.12, pause_hi: 0.27, breath_share: 0.08,
+        missing: [], before: { pause: 0.2, cut_breaths: true }, after: { pause: 0.18, cut_breaths: true } } }), report: { pause: 0.18 } }), 800);
+      return true;
+    },
+    style_undo: async () => Object.assign(settings, { pause: 0.2, style_ref: null }),
     llm_status: async () => ({ choice: '9b', has_9b: true, has_4b: false, size_9b: 5.68e9, size_4b: 2.74e9, using: 'Qwen3.5-9B-Q4_K_M.gguf' }),
     learn_info: async () => ({ llm: true, busy: false, report: null, projects: [
       { path: 'E:\\Projects\\Курс\\04 AE 1\\00 PROJECTS\\AE 01.yaitserez', name: 'AE 01.yaitserez' },

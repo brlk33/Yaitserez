@@ -574,6 +574,38 @@ def classify(analysis: dict, settings: dict) -> None:
                    strictness=settings.get("takes_strictness", "medium"), **extra)
 
 
+def reanalyze(analysis: dict, ids: list[int], settings: dict, progress=None, cancelled=lambda: False) -> int:
+    """Заново разобрать дубли фраз ids (выделенный участок): нейросеть смотрит только на них и на
+    несколько фраз после — там ищется более поздний вариант. Подсказки остальных фраз не меняются.
+    Возвращает, сколько фраз модель предлагает убрать на участке."""
+    from . import llm
+    from . import transcribe as tr
+
+    phrases = analysis["phrases"]
+    ids = sorted({int(i) for i in ids if 0 <= int(i) < len(phrases)})
+    if not ids:
+        return 0
+    llm.CHOICE["model"] = settings.get("llm_model", "9b")
+    if not (settings.get("drop_bad_takes", True) and settings.get("smart_takes", True) and llm.available()):
+        return 0   # без нейросети дубли и так разберутся правилами при пересчёте; старые подсказки оставляем
+    sub = phrases[ids[0]: ids[-1] + 1 + llm.PAIR_NEXT]
+    tr.release()   # видеопамять — языковой модели
+    try:
+        res = llm.analyze(sub, "en" if settings.get("language") == "en" else "ru",
+                          progress=progress, cancelled=cancelled,
+                          examples=(settings.get("learned") or {}).get("examples") or None)
+    finally:
+        llm.SERVER.stop()
+        tr.preload(settings.get("model", "large-v3-turbo"))
+    if cancelled():
+        raise Cancelled()
+    keep = set(ids)
+    hints = {int(k): v for k, v in (analysis.get("llm") or {}).items() if int(k) not in keep}
+    hints.update({k: v for k, v in res.items() if k in keep})
+    analysis["llm"] = hints
+    return sum(1 for k in res if k in keep)
+
+
 def public_analysis(analysis: dict) -> dict:
     """То, что уходит в интерфейс."""
     W = analysis["words"]

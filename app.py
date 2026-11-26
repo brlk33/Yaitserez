@@ -70,6 +70,8 @@ DEFAULTS = {
     "theme": "system",
     "ui_lang": "ru",
     "learned": None,     # «Учиться на моих правках»: {"params", "examples", "report"}
+    "style_ref": None,   # «Стиль нарезки по образцу»: отчёт последнего образца
+    "auto_update": True,
 }
 
 
@@ -95,6 +97,7 @@ FIXED = {"equalize": True, "pause_place": "auto", "smart_takes": True, "prefer_t
 
 DL: dict = {}
 LEARN: dict = {"busy": False, "cancel": False}
+UPD: dict = {"info": None, "busy": False}
 
 
 class State:
@@ -427,6 +430,29 @@ class Api:
         self._classify()
         return cutter.build_plan(STATE.analysis, STATE.settings, STATE.overrides, STATE.word_overrides, STATE.trims)
 
+    def reanalyze(self, settings: dict, overrides: dict, word_overrides: dict, ids: list):
+        """«Проанализировать заново» выделенный участок: нейросеть заново разбирает дубли его фраз,
+        склейки пересчитываются с текущими настройками. Ручные правки участка интерфейс уже сбросил."""
+        if not STATE.analysis or STATE.busy or LEARN["busy"]:
+            return None
+        self.save_settings(settings)
+        STATE.busy = True
+        STATE.cancel = False
+        try:
+            n = pipeline.reanalyze(STATE.analysis, ids, STATE.settings,
+                                   progress=lambda fr, msg: push("reanalyzeProgress", {"fraction": fr, "message": msg}),
+                                   cancelled=lambda: STATE.cancel)
+            STATE.class_key = None
+            plan = self.replan(settings, overrides, word_overrides)
+            return {"plan": plan, "dropped": n}
+        except pipeline.Cancelled:
+            return {"cancelled": True}
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return {"error": str(e)}
+        finally:
+            STATE.busy = False
+
     def add_tracks(self, paths: list | None = None):
         """Добавить видео на дополнительные дорожки в готовый монтаж (скринкаст, вторая камера…)."""
         if not STATE.analysis:
@@ -496,7 +522,7 @@ class Api:
         keep = {k: v for k, v in an.items() if k not in ("proxies", "more_proxies", "_breaths", "_onsets", "_offsets")}
         meta = {"format": 1, "version": VERSION, "ui": ui,
                 "files": [{"path": f.path, "kind": f.kind} for f in STATE.files.values()],
-                "settings": {k: v for k, v in STATE.settings.items() if k not in ("recent_projects", "hotkeys", "learned")}}
+                "settings": {k: v for k, v in STATE.settings.items() if k not in ("recent_projects", "hotkeys", "learned", "style_ref")}}
         tmp = path + ".tmp"
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
             z.writestr("project.json", json.dumps(meta, ensure_ascii=False))
@@ -694,6 +720,76 @@ class Api:
     def learn_reset(self):
         self.save_settings({"learned": None, "takes_strictness": "medium"})
         return STATE.settings
+
+    # --- стиль нарезки по образцу: XML / проект Premiere ---
+    def style_pick(self):
+        res = WINDOW.create_file_dialog(webview.FileDialog.OPEN, file_types=(
+            L("Монтаж Premiere или DaVinci", "Premiere or DaVinci edit") + " (*.xml;*.prproj)",))
+        if not res:
+            return None
+        return res if isinstance(res, str) else res[0]
+
+    def style_start(self, path: str):
+        from yaitserez import style
+        if LEARN["busy"] or not path or not os.path.isfile(path):
+            return False
+        LEARN.update(busy=True, cancel=False)
+
+        def work():
+            try:
+                rep = style.learn(path, dict(STATE.settings),
+                                  progress=lambda fr, msg: push("styleProgress", {"fraction": fr, "message": msg}),
+                                  cancelled=lambda: LEARN["cancel"])
+                self.save_settings({**rep["after"], "style_ref": rep})
+                push("styleDone", {"report": rep, "settings": STATE.settings})
+            except style.Cancelled:
+                push("styleDone", {"cancelled": True})
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                push("styleDone", {"error": str(e)})
+            finally:
+                LEARN["busy"] = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def style_undo(self):
+        rep = STATE.settings.get("style_ref") or {}
+        back = {k: v for k, v in (rep.get("before") or {}).items() if v is not None}
+        self.save_settings({**back, "style_ref": None})
+        return STATE.settings
+
+    # --- обновления ---
+    def check_update(self, manual: bool = False):
+        from yaitserez import update
+        if not manual and not STATE.settings.get("auto_update", True):
+            return None
+        try:
+            UPD["info"] = update.check(VERSION)
+        except Exception:  # noqa: BLE001 — нет интернета или GitHub недоступен: молча
+            return None
+        return UPD["info"] and {"version": UPD["info"]["version"], "notes": UPD["info"]["notes"],
+                                "dev": update.dev_checkout()}
+
+    def install_update(self):
+        from yaitserez import update
+        if not UPD["info"] or UPD["busy"] or STATE.busy or LEARN["busy"]:
+            return False
+        UPD["busy"] = True
+
+        def work():
+            try:
+                update.install(UPD["info"], lambda fr, msg: push("updateProgress", {"fraction": fr, "message": msg}))
+                push("updateProgress", {"fraction": 1.0, "message": L("Перезапускаю…", "Restarting…")})
+                update.restart()
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                push("updateFailed", {"message": str(e)})
+            finally:
+                UPD["busy"] = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
 
     def llm_status(self):
         from yaitserez import llm

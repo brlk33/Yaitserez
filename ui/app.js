@@ -100,6 +100,8 @@ function renderAppSettings() {
   $('#asrDesc').textContent = t(S.gigaam ? 'asr_desc' : 'asr_desc_none');
   loadLlm();
   loadLearn();
+  renderStyle();
+  renderUpdate();
   renderHotkeys();
   $('#aboutLine').textContent = t('about', 'v' + (S.version || ''));
 }
@@ -223,6 +225,7 @@ function toast(text, opts = {}) {
   if (opts.action) el.append(h('button', { onclick: () => { opts.action.fn(); kill(); } }, opts.action.label));
   $('#toasts').append(el);
   setTimeout(kill, opts.ms || 4200);
+  return kill;
 }
 
 /* ---------- экраны ---------- */
@@ -797,7 +800,12 @@ function renderTools() {
   const r = h('button', { class: 'tool', id: 'redoBtn', title: t('k_redo') + ` (${Keys.label('redo')})`, html: '<svg viewBox="0 0 16 16" width="16" height="16"><path d="M10.5 4l3 3-3 3M13 7H6.5a4 4 0 000 8H9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>' });
   u.addEventListener('click', undo);
   r.addEventListener('click', redo);
-  box.append(u, r);
+  box.append(u, r, h('div', { class: 'tool-sep' }));
+  const ra = h('button', { class: 'tool tool-text', id: 'reBtn', title: t('re_hint') + (Keys.label('reanalyze') ? ` (${Keys.label('reanalyze')})` : ''),
+    html: '<svg viewBox="0 0 16 16" width="16" height="16"><path d="M13 5.2A5.6 5.6 0 003 6.3M3 10.8a5.6 5.6 0 0010-1.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M13.6 2.4v3.3h-3.3M2.4 13.6v-3.3h3.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>' });
+  ra.append(h('span', {}, t('re_btn')));
+  ra.addEventListener('click', () => reanalyzeRegion());
+  box.append(ra);
   renderEditState();
 }
 /* ---------- склейка: выбрать, убрать (вернуть паузу) ---------- */
@@ -887,7 +895,91 @@ function extractMarks() {
   Player.seek(a, false);
 }
 
-/* ---------- склейки: где что вырезано ---------- *//* ---------- склейки: где что вырезано ---------- */
+/* ---------- «Проанализировать заново»: пересчитать дубли и склейки только выделенного участка ---------- */
+/** Куски участка: между метками In/Out, иначе выделенные. Сплошной диапазон индексов [k0, k1]. */
+function regionPieces(ks) {
+  if (!ks) {
+    if (S.marks.in != null || S.marks.out != null) {
+      const g0 = S.marks.in != null ? S.marks.in : 0, g1 = S.marks.out != null ? S.marks.out : S.dur;
+      ks = S.items.filter((it) => it.t < g1 - 0.01 && it.t + (it.out - it.in) > g0 + 0.01).map((it) => it.k);
+    } else ks = [...S.sel];
+  }
+  if (!ks.length) return null;
+  return [Math.min(...ks), Math.max(...ks)];
+}
+/** Участок исходника, который покрывают куски k0..k1, — от самого раннего начала до самого позднего конца
+    (вместе с тем, что между ними вырезано). [[клип, от, до], …] по клипам. */
+function regionSpans(k0, k1) {
+  const ps = S.edl.slice(k0, k1 + 1);
+  const lo = ps.reduce((m, p) => (!m || p.clip < m.clip || (p.clip === m.clip && p.in < m.t) ? { clip: p.clip, t: p.in } : m), null);
+  const hi = ps.reduce((m, p) => (!m || p.clip > m.clip || (p.clip === m.clip && p.out > m.t) ? { clip: p.clip, t: p.out } : m), null);
+  const out = [];
+  for (let c = lo.clip; c <= hi.clip; c++) out.push([c, c === lo.clip ? lo.t : 0, c === hi.clip ? hi.t : Infinity]);
+  return out;
+}
+const inSpans = (spans, c, a, b) => spans.some(([sc, s0, s1]) => sc === c && b > s0 + 0.01 && a < s1 - 0.01);
+let reBusy = false;
+async function reanalyzeRegion(ks) {
+  if (reBusy || S.busy) return;
+  const r = regionPieces(ks);
+  if (!r) { toast(t('re_none'), { ms: 3500 }); return; }
+  let [k0, k1] = r;
+  const spans = regionSpans(k0, k1), edlBefore = S.edl;
+  const ids = S.analysis.phrases.filter((p) => inSpans(spans, p.clip, p.start, p.end)).map((p) => p.id);
+  if (!ids.length) { toast(t('re_empty'), { ms: 3000 }); return; }
+  // ручные правки участка — забываем: участок режется с нуля
+  const ov = { ...S.overrides }, wo = { ...S.wordOverrides };
+  for (const id of ids) {
+    const p = S.analysis.phrases[id];
+    delete ov[id];
+    for (let w = p.w0; w < p.w0 + p.words.length; w++) delete wo[w];
+  }
+  reBusy = true;
+  S.busy = true; S.busyFrac = 0; renderModelState();
+  const btn = $('#reBtn'); if (btn) btn.disabled = true;
+  const hide = toast(t('re_running', ids.length), { ms: 600000, action: { label: t('cancel'), fn: () => api('cancel') } });
+  let res;
+  try { res = await api('reanalyze', S.settings, ov, wo, ids); } finally {
+    reBusy = false; S.busy = false; renderModelState(); hide();
+    if ($('#reBtn')) $('#reBtn').disabled = false;
+  }
+  if (!res || res.cancelled) { toast(t(res ? 'cancelled' : 're_busy'), { ms: 2500 }); return; }
+  if (res.error) { toast(res.error, { error: true, ms: 8000 }); return; }
+  if (S.edl !== edlBefore) {   // пока считали, монтаж правили — ищем куски участка заново
+    const ks2 = S.edl.map((p, k) => (inSpans(spans, p.clip, p.in, p.out) ? k : -1)).filter((k) => k >= 0);
+    if (!ks2.length) { toast(t('re_lost'), { error: true, ms: 5000 }); return; }
+    k0 = Math.min(...ks2); k1 = Math.max(...ks2);
+  }
+  const anchor = viewAnchor();
+  // в историю — точный монтаж: подсказки нейросети уже новые, пересчёт автоматики старое не вернёт
+  const st = curState();
+  if (!S.manual) { st.manual = true; st.edl = S.edl; st.autoEdl = S.edl; }
+  Edit.push(st);
+  markDirty();
+  const fresh = edlFromPlan(res.plan);
+  // новые куски участка — свежая автоматика, обрезанная по краям участка; метки и зумы — со старых кусков
+  const old = S.edl.slice(k0, k1 + 1), mid = [];
+  for (const p of fresh) for (const [c, a, b] of spans) {
+    if (p.clip !== c || p.out <= a || p.in >= b) continue;
+    const q = { clip: c, in: Math.max(p.in, a), out: Math.min(p.out, b) };
+    if (q.out - q.in < Edit.FRAME) continue;
+    const m = (q.in + q.out) / 2, was = old.find((o) => o.clip === c && o.in <= m && o.out >= m);
+    if (was) for (const [key, v] of Object.entries(was)) if (!['clip', 'in', 'out'].includes(key)) q[key] = v;
+    mid.push(q);
+  }
+  S.plan = res.plan;
+  S.overrides = ov; S.wordOverrides = wo;
+  S.edl = [...S.edl.slice(0, k0), ...mid, ...S.edl.slice(k1 + 1)];
+  S.autoEdl = fresh;
+  S.manual = true;
+  S.sel = new Set(mid.map((_, i) => k0 + i));
+  S.selCut = null;
+  renderEDL(false);
+  restoreAnchor(anchor);
+  toast(t('re_done', ids.length, res.dropped), { action: { label: t('k_undo'), fn: undo }, ms: 6000 });
+}
+
+/* ---------- склейки: где что вырезано ---------- */
 let CUTS = [];
 function computeCuts() {
   CUTS = [];
@@ -1962,6 +2054,7 @@ const TL = createTimeline({
     const items = [{ label: t('ctx_delete'), sub: Keys.label('ripple_delete'), fn: () => runOp({ type: 'delete', ks: S.sel.has(i) ? [...S.sel] : [i] }) }];
     items.push({ label: t('ctx_label'), sub: '›', fn: () => { const ks = S.sel.has(i) ? [...S.sel] : [i]; setTimeout(() => openMenu(fake, t('ctx_label'), labelMenuItems(ks)), 0); } });
     items.push({ label: t('ctx_split_here'), sub: Keys.label('split'), fn: () => { Player.seek(Math.max(Player.time(), it.t), false); splitAtHead(); } });
+    items.push({ label: t('re_ctx'), sub: Keys.label('reanalyze'), fn: () => reanalyzeRegion(S.sel.has(i) ? [...S.sel] : [i]) });
     for (const p of ps.slice(0, 6)) items.push({ label: t('remove_phrase', p.words.map((w) => w[0]).join(' ').slice(0, 44)), fn: () => setStatus([p], 'bad') });
     const fake = { getBoundingClientRect: () => ({ left: e.clientX, right: e.clientX, top: e.clientY, bottom: e.clientY }) };
     openMenu(fake, `${S.analysis.clips[it.clip].name} · ${tc(it.in)}–${tc(it.out)}`, items);
@@ -2457,7 +2550,7 @@ const RUN = {
   undo, redo, select_all: () => { S.sel = new Set(S.items.map((_, i) => i)); TL.redraw(); }, deselect: () => { S.sel = new Set(); TL.redraw(); closeMenu(); },
   zoom_in: () => TL.zoomIn(), zoom_out: () => TL.zoomOut(), zoom_fit: () => TL.fit(),
   find: () => { document.querySelector('.side-tab[data-tab="text"]').click(); $('#searchInput').focus(); $('#searchInput').select(); },
-  export: () => exportXml(),
+  export: () => exportXml(), reanalyze: () => reanalyzeRegion(),
   ui_zoom_in: () => stepZoom(1), ui_zoom_out: () => stepZoom(-1), ui_zoom_reset: () => applyZoom(1, true),
   save_project: () => saveProject(false), save_project_as: () => saveProject(true), open_project: () => openProject(),
 };
@@ -2576,6 +2669,17 @@ const App = {
     renderLearn();
   },
   llmProgress(d) { llmProg = d; renderLlm(); },
+  reanalyzeProgress(d) { S.busyFrac = d.fraction || 0; renderModelState(); },
+  styleProgress(d) { STYLE.prog = d; STYLE.busy = true; renderStyle(); },
+  styleDone(d) {
+    STYLE.busy = false; STYLE.prog = null;
+    if (d.report) { settingsChanged(d.settings); toast(t('style_done', d.report.pause)); }
+    else if (d.error) toast(d.error, { error: true, ms: 8000 });
+    else if (d.cancelled) toast(t('cancelled'));
+    renderStyle();
+  },
+  updateProgress(d) { UPD.prog = d; renderUpdate(); },
+  updateFailed({ message }) { UPD.prog = null; renderUpdate(); toast(message, { error: true, ms: 9000 }); },
   llmDone({ error, status }) {
     llmProg = null; LLM = status; renderLlm();
     if (error) toast(error, { error: true, ms: 7000 }); else toast(t('llm_ready'));
@@ -2737,6 +2841,97 @@ function learnReport(r) {
   el.append(reset);
   return el;
 }
+/* ---------- стиль нарезки по образцу: XML или проект Premiere ---------- */
+const STYLE = { busy: false, prog: null };
+async function pickStyle() {
+  const path = await api('style_pick');
+  if (!path) return;
+  STYLE.busy = true; STYLE.prog = null; renderStyle();
+  if (!(await api('style_start', path))) { STYLE.busy = false; renderStyle(); toast(t('learn_busy'), { error: true }); }
+}
+/** Новые настройки пауз: открытый монтаж пересчитывается сразу (ручная работа остаётся, Ctrl+Z работает). */
+function settingsChanged(next) {
+  if (S.analysis) { Edit.push(curState()); markDirty(); }
+  S.settings = next;
+  renderSettings($('#settings'), SETTINGS_MAIN, onMainSetting);
+  if (S.analysis) { renderSettings($('#liveSettings'), SETTINGS_LIVE, onLiveSetting); replan(); renderEditState(); }
+}
+function progRow(p, onStop) {
+  const row = h('div', { class: 'learn-prog' },
+    h('div', { class: 'llm-bar learn-bar' }, h('div', { class: 'llm-fill', style: `width:${Math.round((p.fraction || 0) * 100)}%` })),
+    h('span', { class: 'hint' }, p.message));
+  if (onStop) {
+    const stop = h('button', { class: 'btn btn-ghost btn-sm' }, t('llm_stop'));
+    stop.addEventListener('click', onStop);
+    row.append(stop);
+  }
+  return row;
+}
+function renderStyle() {
+  const box = $('#styleBox');
+  if (!box || !S.settings) return;
+  box.innerHTML = '';
+  box.append(h('p', { class: 'set-desc learn-intro' }, t('style_d')));
+  if (STYLE.busy) box.append(progRow(STYLE.prog || { fraction: 0, message: t('learn_start') }, () => api('learn_cancel')));
+  else {
+    const go = h('button', { class: 'btn btn-primary', disabled: LEARN.busy }, t('style_pick'));
+    go.addEventListener('click', pickStyle);
+    box.append(h('div', { class: 'learn-go' }, go, h('span', { class: 'hint' }, t('style_time'))));
+  }
+  const r = S.settings.style_ref;
+  if (!r) return;
+  const el = h('div', { class: 'learn-report' },
+    h('div', { class: 'set-label' }, t('style_report', r.file, r.sequence)),
+    h('div', { class: 'set-desc' }, t('style_nums', r.cuts, r.pause, r.pause_lo, r.pause_hi)),
+    h('div', { class: 'set-desc' }, t(r.after.cut_breaths ? 'style_br_cut' : 'style_br_keep', pct(r.breath_share))));
+  if (r.missing && r.missing.length) el.append(h('div', { class: 'set-desc' }, t('style_missing', r.missing.join(', '))));
+  const undoBtn = h('button', { class: 'btn btn-ghost btn-sm' }, t('style_undo'));
+  undoBtn.addEventListener('click', async () => { settingsChanged(await api('style_undo')); renderStyle(); toast(t('style_undone')); });
+  el.append(undoBtn);
+  box.append(el);
+}
+
+/* ---------- обновления с GitHub ---------- */
+const UPD = { info: null, prog: null };
+async function checkUpdate(manual) {
+  const r = await api('check_update', !!manual);
+  UPD.info = r || null;
+  renderUpdate();
+  if (r && !manual) toast(t('upd_avail', r.version), { action: { label: t('upd_go'), fn: installUpdate }, ms: 15000 });
+  else if (manual && !r) toast(t('upd_none'), { ms: 2500 });
+}
+async function installUpdate() {
+  if (S.busy) { toast(t('upd_busy'), { error: true }); return; }
+  if (S.dirty && S.analysis && !(await saveProject(false))) { toast(t('upd_save'), { ms: 4000 }); return; }
+  UPD.prog = { fraction: 0, message: t('upd_start') }; renderUpdate();
+  if (!(await api('install_update'))) { UPD.prog = null; renderUpdate(); toast(t('upd_busy'), { error: true }); }
+}
+function renderUpdate() {
+  const box = $('#updBox');
+  if (!box || !S.settings) return;
+  box.innerHTML = '';
+  const on = S.settings.auto_update !== false;
+  const row = h('div', { class: 'set-row click' }, h('button', { class: 'switch' + (on ? ' on' : '') }),
+    h('div', { class: 'set-text' }, h('div', { class: 'set-label' }, t('upd_auto')), h('div', { class: 'set-desc' }, t('upd_auto_d'))));
+  row.addEventListener('click', () => { S.settings.auto_update = !on; api('save_settings', { auto_update: !on }); renderUpdate(); });
+  box.append(row);
+  if (UPD.prog) { box.append(progRow(UPD.prog)); return; }
+  const text = h('div', { class: 'set-text' });
+  const st = h('div', { class: 'set-row' }, text);
+  if (UPD.info) {
+    text.append(h('div', { class: 'set-label' }, t('upd_avail', UPD.info.version)), h('div', { class: 'set-desc' }, t('upd_restart')));
+    const go = h('button', { class: 'btn btn-primary btn-sm' }, t('upd_go'));
+    go.addEventListener('click', installUpdate);
+    st.append(go);
+  } else {
+    text.append(h('div', { class: 'set-label' }, t('upd_current', S.version || '')));
+    const chk = h('button', { class: 'btn btn-secondary btn-sm' }, t('upd_check'));
+    chk.addEventListener('click', () => checkUpdate(true));
+    st.append(chk);
+  }
+  box.append(st);
+}
+
 function renderModelCallout() {
   const c = $('#modelCallout');
   const parts = t(S.model ? 'model_vt' : 'model_dl');
@@ -2763,4 +2958,5 @@ function renderModelCallout() {
   setLang(S.settings.ui_lang || LANG, false);
   renderVolume();
   S.view = null; show('files');
+  if (S.settings.auto_update !== false) setTimeout(() => checkUpdate(false), 4000);
 })();
